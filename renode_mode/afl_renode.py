@@ -50,7 +50,10 @@ STATUS_ABORT = W_EXITCODE(0, signal.SIGABRT)
 
 INFD = FORKSRV_FD - 1
 
-endgame = {0: STATUS_SEGV}
+# Index here is the PC value of the instruction that caused the end of fuzzing.
+# IOW, k_sys_fatal_handler.
+fatal_loc = int(os.environ["AFL_K_SYS_FATAL_HANDLER_LOC"], 16)
+endgame = {0: STATUS_SEGV, fatal_loc: STATUS_ABORT}
 sysbus_name = "sysbus"
 
 
@@ -123,7 +126,12 @@ def one_fuzz_complete(status):
     if n == -1:
         return do_quit()
 
-    if status != STATUS_SUCCESS:
+    f = open("/tmp/afl_renode_status", "a")
+    print("Status:", status, file=f)
+    f.close()
+
+    #if status != STATUS_SUCCESS:
+    if status != STATUS_SUCCESS or True:
         monitor.Machine.Reset()
         reset = True
     do_one_fuzz()
@@ -164,11 +172,14 @@ def log_basic_block(pc, size):
     loc = hash((pc, size)) % MAP_SIZE
     visited.add(loc)
     afl_mem.contents[loc] += 1
+    #f = open("/tmp/afl_renode_log", "a")
+    #print("PC:", hex(pc), "Size:", size, "Loc:", loc, file=f)
     if pc in endgame:
         # defer cleanup and restart to avoid hangs
         status = endgame[pc]
         for cpu in monitor.Machine[sysbus_name].GetCPUs():
             cpu.ClearHookAtBlockBegin()
+    #f.close()
 
 
 if shmid == -1:
