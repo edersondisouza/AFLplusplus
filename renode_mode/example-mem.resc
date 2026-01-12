@@ -1,9 +1,12 @@
 #!/usr/bin/env renode
 
-py "import afl_mem"
+#py "import afl_mem"
 
 :$elf?=@zephyr.elf
 i "/home/ederson/work/zephyr/zephyr-west/zephyr/boards/renode/cortex_r8_virtual/support/cortex_r8_virtual.resc"
 emulation SetGlobalQuantum "0.05"
 emulation SetGlobalAdvanceImmediately true
-s
+
+sysbus LoadBinary $input 0x80000000
+
+#s
