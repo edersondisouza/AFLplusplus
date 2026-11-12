@@ -130,7 +130,7 @@ static const u8 count_class_binary[256] = {
 
 };
 
-static void kill_child() {
+static void kill_child(int i) {
 
   timed_out = 1;
   if (fsrv->child_pid > 0) {

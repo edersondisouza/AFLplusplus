@@ -110,7 +110,7 @@ static u8 count_class_lookup[256] = {
 
 };
 
-static void kill_child() {
+static void kill_child(int i) {
 
   if (fsrv.child_pid > 0) {
 

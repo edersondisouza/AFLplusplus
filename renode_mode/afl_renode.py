@@ -4,7 +4,6 @@ from __future__ import print_function
 
 import ctypes, struct
 import os, sys
-import signal
 
 # taken from AFL's config.h
 FORKSRV_FD = 198
@@ -22,8 +21,11 @@ monitor = monitor_module.monitor
 emulationManager = monitor_module.emulationManager
 
 try:
-    libc = ctypes.CDLL("", use_errno=True)
-except SystemError:
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    except Exception:
+        libc = ctypes.CDLL("", use_errno=True)
+except Exception:
     print("Could not find libdl.so in system libraries or LD_LIBRARY_PATH.  This is likely caused by IronPython using wrong ABI location of libdl.so.2; try to install development headers for libc, or to create a symlink to libdl.so.2 named libdl.so as a workaround.")
     raise
 
@@ -45,13 +47,24 @@ def W_EXITCODE(ret, sig):
     return (ret << 8) | sig
 
 STATUS_SUCCESS = W_EXITCODE(0, 0)
-STATUS_SEGV = W_EXITCODE(0, signal.SIGSEGV)
-STATUS_ABORT = W_EXITCODE(0, signal.SIGABRT)
+# IronPython's signal module may expose Windows signal numbers (e.g. SIGABRT=22),
+# so use the Linux values expected by afl-fuzz.
+LINUX_SIGSEGV = 11
+LINUX_SIGABRT = 6
+STATUS_SEGV = W_EXITCODE(0, LINUX_SIGSEGV)
+STATUS_ABORT = W_EXITCODE(0, LINUX_SIGABRT)
 
 INFD = FORKSRV_FD - 1
 
+# PC values (block starts) that end a fuzzing run with the given status.
 endgame = {0: STATUS_SEGV}
 sysbus_name = "sysbus"
+
+# Symbols whose entry is treated as a crash. On Cortex-M, a call through a NULL
+# pointer raises a UsageFault (INVSTATE) rather than executing at address 0, so
+# Zephyr's fatal error handler is the reliable crash indicator.
+CRASH_SYMBOLS_ENV_VAR = "AFL_RENODE_CRASH_SYMBOLS"
+DEFAULT_CRASH_SYMBOLS = "k_sys_fatal_error_handler"
 
 
 if shmid != -1:
@@ -90,7 +103,25 @@ def do_quit():
             return
     sys.exit(0)
 
+def register_crash_symbols():
+    names = os.environ.get(CRASH_SYMBOLS_ENV_VAR, DEFAULT_CRASH_SYMBOLS)
+    bus = monitor.Machine[sysbus_name]
+    for name in [n.strip() for n in names.split(",") if n.strip()]:
+        addrs = set()
+        for cpu in bus.GetCPUs():
+            try:
+                # clear the Thumb bit, block hooks report even addresses
+                addrs.update(int(a) & ~1 for a in bus.GetAllSymbolAddresses(name, cpu))
+            except Exception:
+                pass
+        if not addrs:
+            print("AFL-Renode: crash symbol '%s' not found, ignoring" % name)
+        for addr in addrs:
+            endgame[addr] = STATUS_ABORT
+            print("AFL-Renode: crash symbol %s at %s" % (name, hex(addr)))
+
 def start_fuzzing():
+    register_crash_symbols()
     monitor.Machine.LocalTimeSource.SinksReportedHook += do_quantum_hook
     for cpu in monitor.Machine[sysbus_name].GetCPUs():
         cpu.SetHookAtBlockBegin(log_basic_block)

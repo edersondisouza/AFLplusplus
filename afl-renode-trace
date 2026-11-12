@@ -7,7 +7,13 @@ exec 197<&0
 pipe=/tmp/afl.$$.$RANDOM
 mkfifo $pipe
 
-libdl_so=/lib/x86_64-linux-gnu/libdl.so.2
+libdl_so=$(ldconfig -p 2>/dev/null | awk '/libdl\.so\.2 .*x86-64/ {print $NF; exit}')
+for candidate in "$libdl_so" /lib/x86_64-linux-gnu/libdl.so.2 /usr/lib/libdl.so.2 /usr/lib64/libdl.so.2; do
+    if [ -f "$candidate" ]; then
+        libdl_so=$candidate
+        break
+    fi
+done
 
 if [ -f "$libdl_so" ]; then
     ln -fs "$libdl_so" libdl

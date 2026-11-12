@@ -31,7 +31,19 @@ Full-system binary-only instrumentation in Renode for afl-fuzz
    $ echo 'abcdefxyz' > INPUTS/some-testcase  # true corpus works better
    $ PATH=$PATH:<path-to-renode> AFL_SKIP_BIN_CHECK=1 ./afl-fuzz -t 15000 -i INPUTS -o OUTPUTS -R -- renode_mode/example.resc
 
-Note:
+Notes:
+
+    On Cortex-M, jumping to a NULL function pointer raises a UsageFault
+    instead of executing at address 0, so besides PC 0 the harness also
+    treats entering ``k_sys_fatal_error_handler`` (Zephyr) as a crash.
+    Override the crash symbols with a comma-separated list in
+    ``AFL_RENODE_CRASH_SYMBOLS``.
+
+    If ``core_pattern`` pipes to a crash handler (e.g. systemd-coredump)
+    and you cannot change it, set ``AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1``;
+    crashes are reported by the harness, not by real core dumps.
+
+    The ``efr32mg_sltb004a`` Zephyr board is now named ``sltb004a``.
 
     While ``renode_mode/example.resc`` is executable, it shouldn't be run as a separate, standalone Renode script - it depends on several settings provided by ``afl-renode-trace``.
 
