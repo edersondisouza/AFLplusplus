@@ -4,10 +4,17 @@ AFL++ harness for zephyr-syscall-fuzz (see zephyr-syscall-fuzz/src/main.c).
 The whole test case is written into the guest's afl_input buffer right after
 each machine reset, before the CPU runs. Runs end only when the guest calls one
 of its afl_* marker functions, or when the host-side watchdog fires.
+
+On failure the guest's afl_crash record is decoded and printed (standalone
+mode) and, if AFL_RENODE_CRASH_INFO names a directory, saved there as
+<sha1 of the test case>.txt. For debugging with GDB:
+  AFL_RENODE_HOLD=1      keep the machine alive after a failure
+  AFL_RENODE_NO_START=1  do not start the CPU; let the debugger do it
 '''
 
 import os
 import ctypes
+import hashlib
 import struct
 
 import System
@@ -23,6 +30,40 @@ STATUS_HANG = W_EXITCODE(0, LINUX_SIGALRM)
 
 # Host-side watchdog, in quanta, in case the guest never reaches a marker.
 MAX_QUANTA = int(os.environ.get("AFL_RENODE_MAX_QUANTA", "3000"))
+CRASH_INFO_DIR = os.environ.get("AFL_RENODE_CRASH_INFO")
+HOLD = os.environ.get("AFL_RENODE_HOLD") == "1"
+NO_START = os.environ.get("AFL_RENODE_NO_START") == "1"
+
+AFL_CRASH_MAGIC = 0xAF1FC4A5
+CRASH_FIELDS = ("magic", "reason", "thread", "esf_valid", "r0", "r1", "r2", "r3",
+                "r12", "lr", "pc", "xpsr", "dfsr", "dfar", "ifsr", "ifar",
+                "assert_file", "assert_line", "op_offset", "op")
+REASONS = {0: "K_ERR_CPU_EXCEPTION", 1: "K_ERR_SPURIOUS_IRQ",
+           2: "K_ERR_STACK_CHK_FAIL", 3: "K_ERR_KERNEL_OOPS",
+           4: "K_ERR_KERNEL_PANIC", 0xFFFFFFFF: "hang"}
+# enum k_fatal_error_reason_arch in zephyr/arch/arm/arch.h, from K_ERR_ARCH_START
+REASONS.update((16 + i, "K_ERR_ARM_" + n) for i, n in enumerate("""
+    MEM_GENERIC MEM_STACKING MEM_UNSTACKING MEM_DATA_ACCESS MEM_INSTRUCTION_ACCESS
+    MEM_FP_LAZY_STATE_PRESERVATION BUS_GENERIC BUS_STACKING BUS_UNSTACKING
+    BUS_PRECISE_DATA_BUS BUS_IMPRECISE_DATA_BUS BUS_INSTRUCTION_BUS
+    BUS_FP_LAZY_STATE_PRESERVATION USAGE_GENERIC USAGE_DIV_0 USAGE_UNALIGNED_ACCESS
+    USAGE_STACK_OVERFLOW USAGE_NO_COPROCESSOR USAGE_ILLEGAL_EXC_RETURN
+    USAGE_ILLEGAL_EPSR USAGE_UNDEFINED_INSTRUCTION SECURE_GENERIC
+    SECURE_ENTRY_POINT SECURE_INTEGRITY_SIGNATURE SECURE_EXCEPTION_RETURN
+    SECURE_ATTRIBUTION_UNIT SECURE_TRANSITION SECURE_LAZY_STATE_PRESERVATION
+    SECURE_LAZY_STATE_ERROR UNDEFINED_INSTRUCTION ALIGNMENT_FAULT BACKGROUND_FAULT
+    PERMISSION_FAULT PERMISSION_FAULT_2ND_LEVEL SYNC_EXTERNAL_ABORT
+    ASYNC_EXTERNAL_ABORT SYNC_PARITY_ERROR ASYNC_PARITY_ERROR DEBUG_EVENT
+    TRANSLATION_FAULT TRANSLATION_FAULT_2ND_LEVEL
+    UNSUPPORTED_EXCLUSIVE_ACCESS_FAULT ACCESS_FLAG_FAULT_1ST_LEVEL
+    ACCESS_FLAG_FAULT_2ND_LEVEL CACHE_MAINTENANCE_INSTRUCTION_FAULT
+    DOMAIN_FAULT_1ST_LEVEL DOMAIN_FAULT_2ND_LEVEL
+    SYNC_EXTERNAL_ABORT_TRANSLATION_TABLE_1ST_LEVEL
+    SYNC_EXTERNAL_ABORT_TRANSLATION_TABLE_2ND_LEVEL TLB_CONFLICT_ABORT
+    SYNC_PARITY_ERROR_TRANSLATION_TABLE_1ST_LEVEL
+    SYNC_PARITY_ERROR_TRANSLATION_TABLE_2ND_LEVEL""".split()))
+ARM_MODES = {0x10: "usr", 0x11: "fiq", 0x12: "irq", 0x13: "svc", 0x17: "abt",
+             0x1b: "und", 0x1f: "sys"}
 
 afl_renode.exit_symbols = {
     "afl_done": STATUS_SUCCESS,
@@ -37,18 +78,24 @@ afl_renode.endgame.pop(0, None)
 data = ctypes.create_string_buffer(INPUT_MAX)
 input_addr = None
 started = False
+held = False
 quanta = 0
+last_input = b""
 _orig_do_one_child = afl_renode.do_one_child
+_orig_one_fuzz_complete = afl_renode.one_fuzz_complete
 
 
 def read_input():
+    '''Reads the whole test case; only the first INPUT_MAX bytes reach the guest'''
+    global last_input
     payload = b""
-    while len(payload) < INPUT_MAX:
-        n = read(INFD, data, INPUT_MAX - len(payload))
+    while True:
+        n = read(INFD, data, INPUT_MAX)
         if n <= 0:
             break
         payload += data.raw[:n]
-    return payload
+    last_input = payload
+    return payload[:INPUT_MAX]
 
 
 def write_input(payload):
@@ -73,7 +120,8 @@ def do_one_child():
 
     if not started:
         started = True
-        emulationManager.Instance.CurrentEmulation.StartAll()
+        if not NO_START:
+            emulationManager.Instance.CurrentEmulation.StartAll()
 
 
 def quantum_hook(mach):
@@ -83,5 +131,79 @@ def quantum_hook(mach):
         afl_renode.status = STATUS_HANG
 
 
+def bus_and_cpu():
+    bus = monitor.Machine[sysbus_name]
+    return bus, list(bus.GetCPUs())[0]
+
+
+def symbolize(addr):
+    bus, cpu = bus_and_cpu()
+    try:
+        name = bus.FindSymbolAt(System.UInt64(addr & ~1), cpu)
+    except Exception:
+        name = None
+    if not name:
+        return hex(addr)
+    name = name.replace(" (entry)", "")
+    base = min(afl_renode.symbol_addresses(name) or [addr & ~1])
+    return "%s (%s+%#x)" % (hex(addr), name, (addr & ~1) - base)
+
+
+def read_string(addr, limit=256):
+    bus, _ = bus_and_cpu()
+    raw = bytes(bytearray(bus.ReadBytes(System.UInt64(addr), limit)))
+    return raw.split(b"\0", 1)[0].decode("ascii", "replace")
+
+
+def describe_failure(status):
+    lines = ["status: %d (%s)" % (status, {STATUS_ABORT: "bug", STATUS_HANG: "hang"}
+                                           .get(status, "other")),
+             "input: %d bytes, sha1 %s" % (len(last_input),
+                                           hashlib.sha1(last_input).hexdigest())]
+    addrs = afl_renode.symbol_addresses("afl_crash")
+    if not addrs:
+        return lines + ["no afl_crash symbol in this ELF"]
+    bus, _ = bus_and_cpu()
+    raw = bytes(bytearray(bus.ReadBytes(System.UInt64(min(addrs)), 4 * len(CRASH_FIELDS))))
+    rec = dict(zip(CRASH_FIELDS, struct.unpack("<%dI" % len(CRASH_FIELDS), raw)))
+    if rec["magic"] != AFL_CRASH_MAGIC:
+        return lines + ["no guest crash record (host watchdog or crash before main)"]
+    lines.append("reason: %d (%s)" % (rec["reason"], REASONS.get(rec["reason"], "?")))
+    lines.append("thread: %s" % symbolize(rec["thread"]))
+    if rec["esf_valid"]:
+        lines.append("pc: %s" % symbolize(rec["pc"]))
+        lines.append("lr: %s" % symbolize(rec["lr"]))
+        lines.append("r0-r3: %s  r12: %#x" % (
+            " ".join("%#x" % rec[r] for r in ("r0", "r1", "r2", "r3")), rec["r12"]))
+        lines.append("xpsr: %#x (mode %s)" % (rec["xpsr"], ARM_MODES.get(rec["xpsr"] & 0x1f, "?")))
+    if rec["reason"] not in (2, 3, 4, 0xFFFFFFFF):
+        lines.append("dfsr: %#x dfar: %#x ifsr: %#x ifar: %#x" % (
+            rec["dfsr"], rec["dfar"], rec["ifsr"], rec["ifar"]))
+    if rec["assert_file"]:
+        lines.append("assert: %s:%d" % (read_string(rec["assert_file"]), rec["assert_line"]))
+    lines.append("last op: %#x at input offset %d" % (rec["op"], rec["op_offset"]))
+    return lines
+
+
+def one_fuzz_complete(status):
+    global held
+    if held:
+        return
+    if status != STATUS_SUCCESS:
+        text = "\n".join(describe_failure(status)) + "\n"
+        if afl_renode.shmid == -1:
+            print("AFL-Renode crash info:\n" + text)
+        if CRASH_INFO_DIR:
+            name = hashlib.sha1(last_input).hexdigest() + ".txt"
+            with open(os.path.join(CRASH_INFO_DIR, name), "w") as f:
+                f.write(text)
+        if HOLD:
+            held = True
+            print("AFL-Renode: holding the machine for the debugger")
+            return
+    _orig_one_fuzz_complete(status)
+
+
 afl_renode.do_one_child = do_one_child
 afl_renode.quantum_hook = quantum_hook
+afl_renode.one_fuzz_complete = one_fuzz_complete

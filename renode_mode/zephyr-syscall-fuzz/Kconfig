@@ -3,8 +3,9 @@
 config SYSCALL_FUZZ_SELFTEST
 	bool "Harness self-test operations"
 	help
-	  Adds operations that deliberately trigger a kernel panic or a
-	  kernel-mode CPU fault, to validate the AFL/Renode crash detection.
+	  Adds operations that deliberately trigger a kernel panic (input op
+	  byte 0xF0), a kernel-mode CPU fault (0xF1) or a kernel assertion
+	  (0xF2), to validate the AFL/Renode crash detection and reporting.
 	  Never enable this for real fuzzing campaigns.
 
 source "Kconfig.zephyr"

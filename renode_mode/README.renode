@@ -111,4 +111,19 @@ the ELF:
       -R -- renode_mode/example-syscall.resc zephyr-syscall-fuzz.elf
 
 Building with CONFIG_SYSCALL_FUZZ_SELFTEST=y plants kernel bugs (input
-bytes 0xF0/0xF1) to check that crash detection works.
+bytes 0xF0/0xF1/0xF2: panic, fault, assertion) to check that crash
+detection works.
+
+The guest build has no console output, for speed. Before reporting a
+failure the guest fills an afl_crash record (fatal reason, thread,
+exception frame, DFSR/DFAR/IFSR/IFAR, assertion file:line, and the input
+offset of the op being executed). With AFL_RENODE_CRASH_INFO=<dir> the
+harness decodes it into <dir>/<sha1 of input>.txt, so each file in
+crashes/ can be matched with `sha1sum`. To look at a single input:
+
+  renode_mode/zephyr-syscall-fuzz/replay.sh zephyr-syscall-fuzz.elf <input>
+
+prints the same summary, and with `-g 3333` keeps the crashed machine
+alive behind a GDB server (`-w` waits for the debugger before booting).
+Replay on the same ELF that found the crash: inputs may contain raw
+addresses that are only meaningful for that build.

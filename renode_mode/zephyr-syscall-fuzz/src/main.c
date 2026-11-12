@@ -14,12 +14,19 @@
  *                expected oops (syscall argument validation rejected input)
  *   afl_bug()  - fatal error in kernel context (CPU fault, panic, assertion)
  *   afl_hang() - the user thread did not finish in time
+ *
+ * Before afl_bug() and afl_hang() the harness fills afl_crash, which the host
+ * reads to describe the failure without needing any console output.
  */
 
 #include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/app_memory/app_memdomain.h>
 #include <zephyr/fatal.h>
+#include <zephyr/sys/zassert.h>
+#if defined(CONFIG_CPU_AARCH32_CORTEX_R)
+#include <cmsis_core.h>
+#endif
 
 #define AFL_MAGIC     0xAF1F5C11U
 #define AFL_INPUT_MAX 4096
@@ -33,6 +40,24 @@ struct afl_input {
 
 /* Written by Renode before boot; not touched by ELF loading or BSS init. */
 __noinit struct afl_input afl_input;
+
+#define AFL_CRASH_MAGIC 0xAF1FC4A5U
+
+/* Layout is decoded by afl_syscall.py: keep both in sync. */
+struct afl_crash {
+	uint32_t magic;
+	uint32_t reason;	/* K_ERR_*, or 0xFFFFFFFF for a hang */
+	uint32_t thread;	/* k_current_get() */
+	uint32_t esf_valid;
+	uint32_t r0, r1, r2, r3, r12, lr, pc, xpsr;
+	uint32_t dfsr, dfar, ifsr, ifar;
+	uint32_t assert_file;	/* const char *, 0 if no assertion failed */
+	uint32_t assert_line;
+	uint32_t op_offset;	/* input offset of the user thread's current op */
+	uint32_t op;		/* raw op byte */
+};
+
+__noinit struct afl_crash afl_crash;
 
 /* Marker functions: Renode ends the run when their entry block executes. */
 __noinline void afl_done(void)
@@ -78,6 +103,8 @@ K_APP_BMEM(fz_part) static uint32_t ulen;
 K_APP_BMEM(fz_part) static uint32_t upos;
 K_APP_BMEM(fz_part) static struct k_poll_event events[MAX_EVENTS];
 K_APP_BMEM(fz_part) static uint8_t scratch[32];
+K_APP_BMEM(fz_part) static uint32_t op_offset;
+K_APP_BMEM(fz_part) static uint8_t cur_op;
 
 static struct k_mem_domain fz_domain;
 
@@ -116,6 +143,7 @@ enum fz_op {
 /* Raw op bytes (checked before the modulo) for CONFIG_SYSCALL_FUZZ_SELFTEST */
 #define OP_SELFTEST_PANIC 0xF0
 #define OP_SELFTEST_FAULT 0xF1
+#define OP_SELFTEST_ASSERT 0xF2
 K_APP_BMEM(fz_part) static uint8_t selftest_op;
 
 /*
@@ -165,10 +193,14 @@ static void user_entry(void *p1, void *p2, void *p3)
 	ARG_UNUSED(p3);
 
 	while (upos < ulen) {
+		op_offset = upos;
 		uint8_t op = next_u8();
 
+		cur_op = op;
+
 		if (IS_ENABLED(CONFIG_SYSCALL_FUZZ_SELFTEST) &&
-		    (op == OP_SELFTEST_PANIC || op == OP_SELFTEST_FAULT)) {
+		    (op == OP_SELFTEST_PANIC || op == OP_SELFTEST_FAULT ||
+		     op == OP_SELFTEST_ASSERT)) {
 			selftest_op = op;
 			return;
 		}
@@ -228,6 +260,45 @@ static void user_entry(void *p1, void *p2, void *p3)
 	}
 }
 
+static void record_crash(unsigned int reason, const struct arch_esf *esf)
+{
+	afl_crash.reason = reason;
+	afl_crash.thread = (uint32_t)(uintptr_t)k_current_get();
+	if (esf != NULL) {
+		afl_crash.esf_valid = 1;
+		afl_crash.r0 = esf->basic.r0;
+		afl_crash.r1 = esf->basic.r1;
+		afl_crash.r2 = esf->basic.r2;
+		afl_crash.r3 = esf->basic.r3;
+		afl_crash.r12 = esf->basic.r12;
+		afl_crash.lr = esf->basic.lr;
+		afl_crash.pc = esf->basic.pc;
+		afl_crash.xpsr = esf->basic.xpsr;
+	}
+#if defined(CONFIG_CPU_AARCH32_CORTEX_R)
+	afl_crash.dfsr = __get_DFSR();
+	afl_crash.dfar = __get_DFAR();
+	afl_crash.ifsr = __get_IFSR();
+	afl_crash.ifar = __get_IFAR();
+#endif
+	afl_crash.op_offset = op_offset;
+	afl_crash.op = cur_op;
+	afl_crash.magic = AFL_CRASH_MAGIC;
+}
+
+/* Same as the default, but keeps the location for the crash record */
+void zassert_post_action(const char *file, unsigned int line)
+{
+	afl_crash.assert_file = (uint32_t)(uintptr_t)file;
+	afl_crash.assert_line = line;
+
+	if (k_is_user_context()) {
+		k_oops();
+	}
+	k_panic();
+	CODE_UNREACHABLE;
+}
+
 void k_sys_fatal_error_handler(unsigned int reason, const struct arch_esf *esf)
 {
 	bool user_fault = esf != NULL && (esf->basic.xpsr & MODE_MASK) == MODE_USR;
@@ -239,9 +310,12 @@ void k_sys_fatal_error_handler(unsigned int reason, const struct arch_esf *esf)
 	 */
 	if (k_current_get() == &user_thread &&
 	    (reason == K_ERR_KERNEL_OOPS || user_fault)) {
+		/* A user-context assertion is not a kernel bug either */
+		afl_crash.assert_file = 0;
 		return;
 	}
 
+	record_crash(reason, esf);
 	afl_bug(reason);
 	(void)arch_irq_lock();
 	for (;;) {
@@ -251,6 +325,8 @@ void k_sys_fatal_error_handler(unsigned int reason, const struct arch_esf *esf)
 int main(void)
 {
 	struct k_mem_partition *parts[] = { &fz_part };
+
+	memset(&afl_crash, 0, sizeof(afl_crash));
 
 	if (afl_input.magic != AFL_MAGIC || afl_input.len > AFL_INPUT_MAX) {
 		printk("syscall-fuzz: no valid input\n");
@@ -272,6 +348,7 @@ int main(void)
 	k_thread_start(&user_thread);
 
 	if (k_thread_join(&user_thread, K_MSEC(500)) != 0) {
+		record_crash(0xFFFFFFFFU, NULL);
 		afl_hang();
 		return 0;
 	}
@@ -283,6 +360,7 @@ int main(void)
 			/* Kernel-mode access to unmapped memory */
 			(void)*(volatile uint32_t *)0xF0000000;
 		}
+		__ASSERT(selftest_op != OP_SELFTEST_ASSERT, "selftest assertion");
 	}
 
 	afl_done();
