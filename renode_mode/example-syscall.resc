@@ -1,0 +1,18 @@
+#!/usr/bin/env renode
+
+py "import afl_syscall"
+
+$elf?=@zephyr-syscall-fuzz.elf
+mach create "syscall-fuzz"
+machine LoadPlatformDescription $ORIGIN/cortex_r8_virtual.repl
+cpu PerformanceInMips 50
+
+macro reset
+"""
+    sysbus LoadELF $elf
+"""
+runMacro $reset
+
+emulation SetGlobalQuantum "0.001"
+emulation SetGlobalAdvanceImmediately true
+# Started by afl_syscall.py once the first input has been written

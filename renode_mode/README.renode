@@ -89,3 +89,26 @@ If you want to change the harness, you can do so by copying the
 afl_uart.py file over, changing it, and importing the new file instead
 in your .resc file of choice, 'import antigravity'-style.  See the
 example.resc file for how to do it.
+
+3) Zephyr syscall harness
+-------------------------
+
+afl_syscall.py and example-syscall.resc fuzz Zephyr system calls (k_poll
+and friends) from a user mode thread on cortex_r8_virtual.  The guest
+application is in zephyr-syscall-fuzz/; build it with:
+
+  west build -b cortex_r8_virtual renode_mode/zephyr-syscall-fuzz
+
+Each test case is written into the guest's afl_input buffer right after
+a machine reset (afl_renode.always_reset), and a run ends when the guest
+calls afl_done (success), afl_bug (kernel fault/panic/assert, reported
+as SIGABRT) or afl_hang, or when the host watchdog expires after
+AFL_RENODE_MAX_QUANTA quanta.  User thread oopses are expected and are
+not crashes.  An optional second argument to afl-renode-trace selects
+the ELF:
+
+  afl-fuzz -t 15000 -i renode_mode/zephyr-syscall-fuzz/seeds -o out \
+      -R -- renode_mode/example-syscall.resc zephyr-syscall-fuzz.elf
+
+Building with CONFIG_SYSCALL_FUZZ_SELFTEST=y plants kernel bugs (input
+bytes 0xF0/0xF1) to check that crash detection works.

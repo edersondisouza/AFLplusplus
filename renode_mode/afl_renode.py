@@ -60,12 +60,16 @@ INFD = FORKSRV_FD - 1
 endgame = {0: STATUS_SEGV}
 sysbus_name = "sysbus"
 
-# Symbols whose entry is treated as a crash. On Cortex-M, a call through a NULL
-# pointer raises a UsageFault (INVSTATE) rather than executing at address 0, so
-# Zephyr's fatal error handler is the reliable crash indicator.
+# Symbols whose entry ends a fuzzing run, mapped to the reported status.
+# Harness modules may replace this dict (and edit endgame) before fuzzing starts.
+# On Cortex-M, a call through a NULL pointer raises a UsageFault (INVSTATE)
+# rather than executing at address 0, so by default Zephyr's fatal error
+# handler is treated as a crash.
 CRASH_SYMBOLS_ENV_VAR = "AFL_RENODE_CRASH_SYMBOLS"
 DEFAULT_CRASH_SYMBOLS = "k_sys_fatal_error_handler"
-
+exit_symbols = dict((n.strip(), STATUS_ABORT) for n in
+                    os.environ.get(CRASH_SYMBOLS_ENV_VAR, DEFAULT_CRASH_SYMBOLS).split(",")
+                    if n.strip())
 
 if shmid != -1:
     afl_mem = shmat(shmid, 0, 0)
@@ -103,25 +107,28 @@ def do_quit():
             return
     sys.exit(0)
 
-def register_crash_symbols():
-    names = os.environ.get(CRASH_SYMBOLS_ENV_VAR, DEFAULT_CRASH_SYMBOLS)
+def symbol_addresses(name):
     bus = monitor.Machine[sysbus_name]
-    for name in [n.strip() for n in names.split(",") if n.strip()]:
-        addrs = set()
-        for cpu in bus.GetCPUs():
-            try:
-                # clear the Thumb bit, block hooks report even addresses
-                addrs.update(int(a) & ~1 for a in bus.GetAllSymbolAddresses(name, cpu))
-            except Exception:
-                pass
+    addrs = set()
+    for cpu in bus.GetCPUs():
+        try:
+            # clear the Thumb bit, block hooks report even addresses
+            addrs.update(int(a) & ~1 for a in bus.GetAllSymbolAddresses(name, cpu))
+        except Exception:
+            pass
+    return addrs
+
+def register_exit_symbols():
+    for name, sym_status in exit_symbols.items():
+        addrs = symbol_addresses(name)
         if not addrs:
-            print("AFL-Renode: crash symbol '%s' not found, ignoring" % name)
+            print("AFL-Renode: exit symbol '%s' not found, ignoring" % name)
         for addr in addrs:
-            endgame[addr] = STATUS_ABORT
-            print("AFL-Renode: crash symbol %s at %s" % (name, hex(addr)))
+            endgame[addr] = sym_status
+            print("AFL-Renode: exit symbol %s at %s -> status %d" % (name, hex(addr), sym_status))
 
 def start_fuzzing():
-    register_crash_symbols()
+    register_exit_symbols()
     monitor.Machine.LocalTimeSource.SinksReportedHook += do_quantum_hook
     for cpu in monitor.Machine[sysbus_name].GetCPUs():
         cpu.SetHookAtBlockBegin(log_basic_block)
@@ -142,6 +149,8 @@ def do_one_fuzz():
 
 status = None
 reset = False
+# Harnesses that need a fresh machine for every test case may set this.
+always_reset = False
 def do_one_child():
     global status
     status = None
@@ -154,7 +163,7 @@ def one_fuzz_complete(status):
     if n == -1:
         return do_quit()
 
-    if status != STATUS_SUCCESS:
+    if always_reset or status != STATUS_SUCCESS:
         monitor.Machine.Reset()
         reset = True
     do_one_fuzz()
@@ -203,7 +212,8 @@ def log_basic_block(pc, size):
 
 
 if shmid == -1:
-    do_one_fuzz = do_one_child
+    def do_one_fuzz():
+        do_one_child()
     class afl_mem:
         contents = [0] * MAP_SIZE
     def one_fuzz_complete(status):
