@@ -4,7 +4,7 @@ origin=$(readlink -f "$(dirname "$0")")
 
 exec 197<&0
 
-pipe=/tmp/afl.$$.$RANDOM
+pipe=${TMPDIR:-/tmp}/afl.$$.$RANDOM
 mkfifo $pipe
 
 libdl_so=$(ldconfig -p 2>/dev/null | awk '/libdl\.so\.2 .*x86-64/ {print $NF; exit}')

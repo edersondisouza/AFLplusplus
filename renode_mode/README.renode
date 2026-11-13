@@ -193,13 +193,26 @@ copying the ELF, .cov and .config into the output directory so crashes
 stay replayable after rebuilds:
 
   B=../build-g
-  renode_mode/zephyr-syscall-fuzz/campaign.sh -d 172800 -j 4 -o /srv/fuzz \
+  renode_mode/zephyr-syscall-fuzz/campaign.sh -d 172800 -j 4 \
       objects=$B-objects/zephyr/zephyr.elf futex=$B-futex/zephyr/zephyr.elf \
       futex-kmutex=$B-futex-kmutex/zephyr/zephyr.elf \
       thread=$B-thread/zephyr/zephyr.elf
 
 -n prints the commands without running them.  Each instance is one
 afl-fuzz plus one Renode process (~1 core).
+
+Disk usage: the output defaults to $HOME/zfuzz/<date> (or
+$ZFUZZ_CAMPAIGNS/<date>), and campaign.sh warns if OUT is under /tmp.
+Instances run with TMPDIR=OUT/tmp, because Renode and dotnet put their
+scratch files there (~1 MB per Renode instance, not always removed),
+along with a crash dump each time Renode is killed, and debug pipes and
+sockets.  So nothing grows in /tmp, and `rm -rf OUT/tmp` cleans up after
+a campaign.  The socket path limit means OUT/tmp may be at most 60
+characters long.  The AFL queue dominates: about 4 KB per corpus entry,
+roughly 3-4 MB per instance after 10 minutes, so plan for a few GB for a
+weekend with 16 instances.  Builds are only read at launch (the ELF is
+copied), so they can stay on a small /tmp.  replay.sh and
+replay_corpus.py use TMPDIR too.
 
 Challenges and how they were handled
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

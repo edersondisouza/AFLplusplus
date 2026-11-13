@@ -11,7 +11,8 @@
 #              futex-kmutex=... uses seeds/futex.
 #   -d SECS    duration of every instance (default 600)
 #   -j JOBS    afl-fuzz instances per group: one -M plus JOBS-1 -S (default 1)
-#   -o OUT     output directory (default campaign-<date>)
+#   -o OUT     output directory (default
+#              ${ZFUZZ_CAMPAIGNS:-$HOME/zfuzz}/<date>)
 #   -c MODE    AFL_RENODE_COVERAGE: window (default), kernel or all
 #   -n         print the commands instead of running them
 #
@@ -20,6 +21,9 @@
 # replayed against the exact binary (see replay.sh). Every instance writes
 # OUT/<GROUP>/<instance>.log and crash records to OUT/<GROUP>/crash-info/.
 # Run from anywhere; afl-fuzz is taken from the root of this AFL++ tree.
+#
+# Everything a campaign writes stays in OUT, including Renode/dotnet
+# temporary files (TMPDIR=OUT/tmp), so long campaigns do not fill /tmp.
 
 set -e
 
@@ -28,13 +32,13 @@ afl_root=$(readlink -f "$here/../..")
 resc=$afl_root/renode_mode/example-syscall.resc
 
 usage() {
-    sed -n '4,22s/^# \{0,1\}//p' "$0" >&2
+    sed -n '4,26s/^# \{0,1\}//p' "$0" >&2
     exit 1
 }
 
 secs=600
 jobs=1
-out=campaign-$(date +%Y%m%d-%H%M)
+out=${ZFUZZ_CAMPAIGNS:-$HOME/zfuzz}/$(date +%Y%m%d-%H%M)
 coverage=window
 dry=""
 while getopts "d:j:o:c:nh" opt; do
@@ -52,6 +56,18 @@ shift $((OPTIND - 1))
 
 mkdir -p "$out"
 out=$(readlink -f "$out")
+case $out/ in
+/tmp/*) echo "warning: $out is under /tmp, which may fill up during long campaigns" >&2 ;;
+esac
+# Renode and dotnet put scratch files (~1 MB per Renode instance, not always
+# removed), crash dumps, pipes and Unix sockets in TMPDIR. Socket paths are
+# limited to 107 bytes and dotnet appends ~45, so keep TMPDIR short.
+tmp=$out/tmp
+if [ ${#tmp} -gt 60 ]; then
+    echo "$tmp: too long for TMPDIR (max 60 chars), use a shorter -o" >&2
+    exit 1
+fi
+mkdir -p "$tmp"
 pids=()
 
 for spec in "$@"; do
@@ -71,7 +87,7 @@ for spec in "$@"; do
 
     for i in $(seq 0 $((jobs - 1))); do
         if [ "$i" -eq 0 ]; then role="-M main"; name=main; else role="-S s$i"; name=s$i; fi
-        cmd=(env AFL_NO_UI=1 AFL_SKIP_CPUFREQ=1 AFL_SKIP_BIN_CHECK=1
+        cmd=(env TMPDIR=$tmp AFL_NO_UI=1 AFL_SKIP_CPUFREQ=1 AFL_SKIP_BIN_CHECK=1
              AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 AFL_FORKSRV_INIT_TMOUT=600000
              AFL_RENODE_COVERAGE=$coverage AFL_RENODE_CRASH_INFO=$dir/crash-info
              "$afl_root/afl-fuzz" -V "$secs" -t 15000 -i "$seeds" -o "$dir/afl" $role
