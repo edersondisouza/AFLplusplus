@@ -127,3 +127,27 @@ prints the same summary, and with `-g 3333` keeps the crashed machine
 alive behind a GDB server (`-w` waits for the debugger before booting).
 Replay on the same ELF that found the crash: inputs may contain raw
 addresses that are only meaningful for that build.
+
+Coverage is selected with AFL_RENODE_COVERAGE:
+
+  window  (default) AFL-style edge coverage, only between user_entry and
+          the afl_* marker that ends the run; boot and setup are the same
+          for every input and would only add noise
+  kernel  like window, but without the harness's own functions, listed
+          in <ELF>.cov (written at build time by cov_ranges.py)
+  all     the original afl_renode block coverage, from reset
+
+In 5 minute side-by-side runs, window reached 2745 exact kernel edges,
+all 1521 and kernel 1216: the harness's own coverage tells AFL which op
+sequences are new, and is a useful stepping stone. To compare corpora on
+exact kernel edges, replay them through one Renode instance:
+
+  AFL_RENODE_COVERAGE=kernel renode_mode/zephyr-syscall-fuzz/replay_corpus.py \
+      -e edges.txt renode_mode/example-syscall.resc zephyr-syscall-fuzz.elf \
+      out/default/queue/id*
+  wc -l edges.txt
+
+Do not switch the block hook on and off from cpu.AddHook callbacks: the
+change takes effect at nondeterministic points, which dropped stability
+to ~77% and produced false hangs. afl_syscall keeps the hook installed
+and gates coverage in Python instead, at no measurable cost.

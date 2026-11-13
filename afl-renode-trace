@@ -22,6 +22,7 @@ fi
 elf_cmd=""
 if [ -n "$2" ]; then
     elf_cmd="\$elf=@$(readlink -f "$2"); "
+    export AFL_RENODE_ELF=$(readlink -f "$2")
 fi
 
 # Replace with the commented line below to gain access to Renode graphical interface
