@@ -34,6 +34,14 @@ root=$(readlink -f "$(dirname "$0")/../..")
 
 resc=$(mktemp --suffix=.resc)
 trap 'rm -f "$resc"' EXIT
+# Killing this script must not leave Renode behind (it keeps running, e.g.
+# when holding the machine for GDB)
+kill_tree() {
+    local c
+    for c in $(ps -o pid= --ppid "$1"); do kill_tree "$c"; done
+    kill "$1" 2>/dev/null
+}
+trap 'for c in $(ps -o pid= --ppid $$); do kill_tree "$c"; done; exit 143' TERM INT HUP
 echo "include @$root/renode_mode/example-syscall.resc" >"$resc"
 [ -n "$uart" ] && echo "sysbus.uart0 CreateFileBackend @$uart true" >>"$resc"
 if [ -n "$gdb_port" ]; then
@@ -47,4 +55,5 @@ cd "$root"
 # backtrace printed when standalone mode quits
 ./afl-renode-trace "$resc" "$elf" <"$input" 2>&1 | stdbuf -oL tr -d '\r' |
     grep --line-buffered -vE '^\[[0-9]+, [0-9]+, |\[WARNING\]' |
-    sed -u '/^Exiting with status/q'
+    sed -u '/^Exiting with status/q' &
+wait

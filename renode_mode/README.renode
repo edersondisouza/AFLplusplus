@@ -93,11 +93,13 @@ example.resc file for how to do it.
 3) Zephyr syscall harness
 -------------------------
 
-afl_syscall.py and example-syscall.resc fuzz Zephyr system calls (k_poll
-and friends) from a user mode thread on cortex_r8_virtual.  The guest
-application is in zephyr-syscall-fuzz/; build it with:
+afl_syscall.py and example-syscall.resc fuzz Zephyr system calls from
+user mode threads on cortex_r8_virtual.  The guest application is in
+zephyr-syscall-fuzz/; it is built for one syscall group at a time (see
+"Syscall groups" below), e.g. for k_poll and friends:
 
-  west build -b cortex_r8_virtual renode_mode/zephyr-syscall-fuzz
+  west build -b cortex_r8_virtual -d build-g-poll \
+      renode_mode/zephyr-syscall-fuzz -- -DEXTRA_CONF_FILE=groups/poll.conf
 
 Each test case is written into the guest's afl_input buffer right after
 a machine reset (afl_renode.always_reset), and a run ends when the guest
@@ -107,7 +109,7 @@ AFL_RENODE_MAX_QUANTA quanta.  User thread oopses are expected and are
 not crashes.  An optional second argument to afl-renode-trace selects
 the ELF:
 
-  afl-fuzz -t 15000 -i renode_mode/zephyr-syscall-fuzz/seeds -o out \
+  afl-fuzz -t 15000 -i renode_mode/zephyr-syscall-fuzz/seeds/poll -o out \
       -R -- renode_mode/example-syscall.resc zephyr-syscall-fuzz.elf
 
 Building with CONFIG_SYSCALL_FUZZ_SELFTEST=y plants kernel bugs (input
@@ -151,3 +153,137 @@ Do not switch the block hook on and off from cpu.AddHook callbacks: the
 change takes effect at nondeterministic points, which dropped stability
 to ~77% and produced false hangs. afl_syscall keeps the hook installed
 and gates coverage in Python instead, at no measurable cost.
+
+Syscall groups
+~~~~~~~~~~~~~~
+
+One group per build (groups/<name>.conf), each with its own seeds/
+directory. Groups favour syscalls that are rarely used by in-tree code
+and by external Zephyr applications, as heavily used ones are already
+exercised by tests and products.
+
+  poll          k_poll, k_poll_signal_* over sem/fifo/msgq/pipe/signal
+  objects       k_object_alloc{,_size}/release, k_object_access_grant/
+                check, *_init/alloc_init of every kernel object type,
+                k_event_*, k_condvar_*, k_thread_stack_alloc/free,
+                k_thread_create/join/abort from user mode
+  futex         k_futex_wait/wake, sys_mutex (futex implementation),
+                k_msgq_put_front/peek_at/purge/get_attrs,
+                k_queue_insert/cancel_wait
+  futex-kmutex  same input format, sys_mutex on top of k_mutex
+                (build with groups/futex-kmutex.conf, seeds/futex)
+  thread        k_thread_name_set/copy, priority/deadline, suspend/
+                resume/wakeup/join/abort, timeout getters,
+                k_thread_stack_space_get, custom data
+
+The input is a byte stream of ops: an opcode byte, then the op's
+arguments read in the order the group code consumes them (u32s are
+little endian).  Arguments come from small pools in main.c that mix
+valid and hostile values: fz_ptr() (scratch buffer, NULL, kernel data,
+raw u32, end of scratch, end of the user partition, code), fz_len()
+(small, raw, near SIZE_MAX), fz_timeout() (K_NO_WAIT, a few ticks,
+K_FOREVER, raw) and fz_thread() (self, the other worker, dormant, dead,
+ungranted main thread, NULL, raw).  CONFIG_SYSCALL_FUZZ_WORKERS user
+threads share the stream: when one blocks the next one continues
+reading it, so a "wait" op followed by a "wake" op does what it says.
+gen_seeds.py writes the seeds for objects/futex/thread.
+
+campaign.sh starts one parallel campaign (one -M, JOBS-1 -S) per group,
+copying the ELF, .cov and .config into the output directory so crashes
+stay replayable after rebuilds:
+
+  B=../build-g
+  renode_mode/zephyr-syscall-fuzz/campaign.sh -d 172800 -j 4 -o /srv/fuzz \
+      objects=$B-objects/zephyr/zephyr.elf futex=$B-futex/zephyr/zephyr.elf \
+      futex-kmutex=$B-futex-kmutex/zephyr/zephyr.elf \
+      thread=$B-thread/zephyr/zephyr.elf
+
+-n prints the commands without running them.  Each instance is one
+afl-fuzz plus one Renode process (~1 core).
+
+Challenges and how they were handled
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+* Blocking syscalls.  k_poll only needs one thread, but futex/condvar/
+  event/join waits block forever.  Two user workers share the input,
+  the supervisor (higher priority, kernel mode) ends the run when all
+  workers are blocked or dead, the system is idle for IDLE_TICKS, or
+  HANG_MS of uptime elapsed.  Real hangs are therefore only reported
+  when the kernel itself stops making progress.
+
+* Object handles.  Syscalls take kernel object pointers that must be in
+  the kernel object table and   granted.  Inputs mostly select from per-group handle tables (static
+  granted objects, objects not granted to the caller, objects of the
+  wrong type, dynamic slots filled by k_object_alloc, NULL), with a raw
+  u32 pointer as just one of the choices, so most inputs get past the
+  verifier while the hostile cases are still covered.
+
+* Thread targets.  Thread syscalls are interesting on threads in odd
+  states, so fz_thread() offers a dormant (K_FOREVER-delayed) thread, an
+  already dead one, the ungranted main thread, besides self/peer.
+
+* Determinism / harness self-corruption.  First small runs showed
+  hangs that did not replay: syscalls handed a raw pointer into the user
+  partition overwrote the stream position/length, changing what the
+  rest of the input did.  All stream state now lives in struct fz_mem
+  at the start of the partition (copies off the end of scratch cannot
+  reach it), the kernel keeps its own copy of the length, and the
+  supervisor ends the run deterministically if the state was tampered.
+  Stability is 100% in all groups.
+
+* Dynamic thread stacks.  k_thread_stack_alloc() from the static pool
+  (the default) returns stacks the calling user thread has no
+  permission on, so k_thread_create() always failed with "bad stack
+  object".  groups/objects.conf sets DYNAMIC_THREAD_PREFER_ALLOC so
+  stacks come from the (granted) heap first.
+
+* sys_mutex only enters the kernel when contended (FUTEX
+  implementation): uncontended lock/unlock is an atomic CAS in user
+  space.  The futex seeds lock from one worker and then contend from the
+  other, so the kernel side is reached.
+
+* Separate heap.  K_HEAP fz_heap (SYSCALL_FUZZ_HEAP_SIZE) is the user
+  threads' resource pool, so out-of-memory paths are deterministic.
+
+* Coverage is verified, not assumed: replay_corpus.py -e dumps the
+  edges of the seeds; each seed was checked to reach the kernel
+  function it targets.
+
+Known bugs found (reproducers in zephyr-syscall-fuzz/known-bugs/, run
+them with replay.sh on a build with CONFIG_SYSCALL_FUZZ_SKIP_KNOWN_BUGS=n):
+
+* k_thread_create() from user mode with a very small stack_size: the
+  verifier only checks that the size fits the stack object, but
+  reserve_stack_headroom() (TLS, userspace local data) and the initial
+  exception frame are not checked against buf_size, so the kernel
+  writes below the stack object.  With heap allocated stacks this
+  overwrites the previous heap chunk header and later faults in
+  sys_heap_free() (K_ERR_ARM_BACKGROUND_FAULT) or similar; the new
+  thread itself takes a permission fault on its TLS.
+  (thread-create-stack-size-0, thread-create-stack-size-16)
+
+* k_msgq_alloc_init() accepts msg_size 0 (z_thread_malloc(0) succeeds),
+  and the first k_msgq_put() then trips the write_ptr assertion in
+  put_msg_in_queue() (msg_q.c).  Kernel panic from user mode on
+  CONFIG_ASSERT=y builds. (msgq-alloc-init-msg-size-0)
+
+* Releasing a dynamic k_msgq or k_stack that was never initialized:
+  k_object_alloc() does not zero the object, and when the last reference
+  goes away (k_object_release() or thread exit) unref_check() calls
+  z_msgq_cleanup()/z_stack_cleanup() regardless, which reads stale heap
+  contents as flags/buffer_start and k_free()s them (double free panic
+  with SYS_HEAP_HARDENING, otherwise heap corruption).  K_OBJ_TIMER
+  already guards on K_OBJ_FLAG_INITIALIZED; msgq and stack do not.
+  (msgq-release-uninitialized)
+
+* Two user threads deadlocking on k_mutex trip the MUTEX_DEADLOCK_DETECT
+  assertion (mutex.c, default y with CONFIG_ASSERT), i.e. a user thread
+  can panic the kernel on assert-enabled builds; arguably by design, but
+  it should probably return an error to user mode instead.
+  (kmutex-deadlock-assert, futex-kmutex build)
+
+CONFIG_SYSCALL_FUZZ_SKIP_KNOWN_BUGS (default y) avoids them so long
+campaigns are not filled with variants: too small stacks and msg_size 0
+are not passed, dynamic msgq/stack objects are initialized right after
+allocation (the INIT op then fails on them), and MUTEX_DEADLOCK_DETECT
+defaults to n.  The stream format is the same either way.

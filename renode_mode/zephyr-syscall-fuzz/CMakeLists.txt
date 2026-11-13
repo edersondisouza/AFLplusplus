@@ -5,6 +5,10 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(syscall_fuzz)
 
 target_sources(app PRIVATE src/main.c)
+target_sources_ifdef(CONFIG_SYSCALL_FUZZ_GROUP_POLL app PRIVATE src/group_poll.c)
+target_sources_ifdef(CONFIG_SYSCALL_FUZZ_GROUP_OBJECTS app PRIVATE src/group_objects.c)
+target_sources_ifdef(CONFIG_SYSCALL_FUZZ_GROUP_FUTEX app PRIVATE src/group_futex.c)
+target_sources_ifdef(CONFIG_SYSCALL_FUZZ_GROUP_THREAD app PRIVATE src/group_thread.c)
 
 # Harness code ranges, excluded from AFL coverage (see cov_ranges.py)
 set(cov_ranges ${ZEPHYR_BINARY_DIR}/${KERNEL_ELF_NAME}.cov)

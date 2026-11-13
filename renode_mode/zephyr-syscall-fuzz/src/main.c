@@ -1,19 +1,22 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
  *
- * Syscall fuzzing harness for AFL++ + Renode, targeting k_poll().
+ * Syscall fuzzing harness for AFL++ + Renode.
  *
  * Renode writes the AFL test case into afl_input (a .noinit buffer) before the
- * CPU starts. A supervisor thread copies it into a user-accessible partition
- * and starts a K_USER thread that interprets it as a sequence of operations:
- * fuzzed k_poll() calls plus state-changing syscalls on the polled objects.
+ * CPU starts. The supervisor (main) copies it into a user-accessible partition
+ * and starts CONFIG_SYSCALL_FUZZ_WORKERS K_USER threads that interpret it as a
+ * sequence of operations, defined by the group selected at build time
+ * (group_*.c). All workers consume the same stream: when one blocks in a
+ * syscall, the next one carries on, so it can wake the first one up.
  *
  * The harness reports the outcome by calling one of the afl_*() marker
  * functions, which Renode watches for:
- *   afl_done() - all operations ran, or the user thread was killed by an
- *                expected oops (syscall argument validation rejected input)
+ *   afl_done() - the input was consumed (or every worker blocked or died).
+ *                User oopses (a syscall rejecting its arguments) and user
+ *                faults are expected and only end the offending thread.
  *   afl_bug()  - fatal error in kernel context (CPU fault, panic, assertion)
- *   afl_hang() - the user thread did not finish in time
+ *   afl_hang() - a worker kept running for longer than HANG_MS
  *
  * Before afl_bug() and afl_hang() the harness fills afl_crash, which the host
  * reads to describe the failure without needing any console output.
@@ -21,17 +24,15 @@
 
 #include <string.h>
 #include <zephyr/kernel.h>
-#include <zephyr/app_memory/app_memdomain.h>
 #include <zephyr/fatal.h>
 #include <zephyr/sys/zassert.h>
 #if defined(CONFIG_CPU_AARCH32_CORTEX_R)
 #include <cmsis_core.h>
 #endif
 
-#define AFL_MAGIC     0xAF1F5C11U
-#define AFL_INPUT_MAX 4096
-#define MAX_EVENTS    8
+#include "harness.h"
 
+#define AFL_MAGIC     0xAF1F5C11U
 struct afl_input {
 	uint32_t magic;
 	uint32_t len;
@@ -76,44 +77,51 @@ __noinline void afl_hang(void)
 	__asm__ volatile("" ::: "memory");
 }
 
-/* Kernel objects the user thread may legitimately use */
-K_SEM_DEFINE(fz_sem, 0, 3);
-K_MSGQ_DEFINE(fz_msgq, 4, 4, 4);
-K_QUEUE_DEFINE(fz_queue);
-K_PIPE_DEFINE(fz_pipe, 16, 4);
-struct k_poll_signal fz_signal = K_POLL_SIGNAL_INITIALIZER(fz_signal);
-K_HEAP_DEFINE(fz_heap, 2048);
+K_HEAP_DEFINE(fz_heap, CONFIG_SYSCALL_FUZZ_HEAP_SIZE);
 
 #define USER_STACK_SIZE 2048
-K_THREAD_STACK_DEFINE(user_stack, USER_STACK_SIZE);
-static struct k_thread user_thread;
+K_THREAD_STACK_ARRAY_DEFINE(worker_stacks, NUM_WORKERS, USER_STACK_SIZE);
+struct k_thread workers[NUM_WORKERS];
 
-/*
- * Pool of object pointers for k_poll events. Includes valid objects, objects
- * of the wrong type, a kernel object not granted to the thread, and NULL.
- */
-static void *const objs[] = {
-	&fz_sem, &fz_msgq, &fz_queue, &fz_pipe, &fz_signal,
-	&user_thread, &afl_input, NULL,
-};
+/* Extra thread targets: never started, and already exited */
+K_THREAD_STACK_DEFINE(dormant_stack, 1024);
+static struct k_thread dormant_thread;
+K_THREAD_STACK_DEFINE(dead_stack, 1024);
+static struct k_thread dead_thread;
+static k_tid_t main_tid;
+
+/* Whole run budget for the workers, and how long all may stay blocked */
+#define HANG_MS    500
+#define IDLE_TICKS 4
 
 K_APPMEM_PARTITION_DEFINE(fz_part);
-K_APP_BMEM(fz_part) static uint8_t ubuf[AFL_INPUT_MAX];
-K_APP_BMEM(fz_part) static uint32_t ulen;
-K_APP_BMEM(fz_part) static uint32_t upos;
-K_APP_BMEM(fz_part) static struct k_poll_event events[MAX_EVENTS];
-K_APP_BMEM(fz_part) static uint8_t scratch[32];
-K_APP_BMEM(fz_part) static uint32_t op_offset;
-K_APP_BMEM(fz_part) static uint8_t cur_op;
+/* Last byte the workers can access (the partition is MPU-aligned) */
+extern char z_data_smem_fz_part_part_end[];
+
+/*
+ * The workers' view of the input. It is user memory, so syscalls with fuzzed
+ * pointers can overwrite it: the stream state comes first, so that copies
+ * running off the end of scratch[] or ubuf[] cannot reach it, and the
+ * supervisor ends the run if it changes behind the workers' back (raw
+ * pointers can still hit it).
+ */
+K_APP_BMEM(fz_part) struct fz_mem fz_mem;
+static uint32_t klen;	/* kernel copy of fz_mem.ulen */
 
 static struct k_mem_domain fz_domain;
 
-static uint8_t next_u8(void)
+uint8_t next_u8(void)
 {
-	return (upos < ulen) ? ubuf[upos++] : 0;
+	uint32_t pos = fz_mem.upos;
+
+	if (pos >= fz_mem.ulen || pos >= AFL_INPUT_MAX) {
+		return 0;
+	}
+	fz_mem.upos = pos + 1;
+	return fz_mem.ubuf[pos];
 }
 
-static uint32_t next_u32(void)
+uint32_t next_u32(void)
 {
 	uint32_t v = 0;
 
@@ -123,140 +131,129 @@ static uint32_t next_u32(void)
 	return v;
 }
 
-enum fz_op {
-	OP_POLL,
-	OP_SEM_GIVE,
-	OP_SEM_TAKE,
-	OP_SIGNAL_RAISE,
-	OP_SIGNAL_RESET,
-	OP_MSGQ_PUT,
-	OP_MSGQ_GET,
-	OP_MSGQ_PURGE,
-	OP_QUEUE_APPEND,
-	OP_QUEUE_GET,
-	OP_PIPE_WRITE,
-	OP_PIPE_READ,
-	OP_PIPE_RESET,
-	OP_COUNT,
-};
+void *fz_ptr(void)
+{
+	uint8_t sel = next_u8();
 
-/* Raw op bytes (checked before the modulo) for CONFIG_SYSCALL_FUZZ_SELFTEST */
+	switch (sel % 8) {
+	case 0:
+		return &scratch[next_u8() % SCRATCH_SIZE];
+	case 1:
+		return NULL;
+	case 2:
+		return &afl_crash;		/* kernel data */
+	case 3:
+		return (void *)(uintptr_t)next_u32();
+	case 4:
+		return &scratch[SCRATCH_SIZE - 1 - next_u8() % 8];	/* runs off scratch */
+	case 5:
+		/* partition end */
+		return (void *)((uintptr_t)z_data_smem_fz_part_part_end - 1 - next_u8() % 8);
+	case 6:
+		return (void *)&fz_ptr;		/* code */
+	default:
+		return &scratch[0];
+	}
+}
+
+size_t fz_len(void)
+{
+	uint8_t sel = next_u8();
+
+	switch (sel % 4) {
+	case 0:
+		return next_u8();
+	case 1:
+		return next_u32();
+	case 2:
+		return SIZE_MAX - next_u8();
+	default:
+		return sel >> 2;
+	}
+}
+
+k_timeout_t fz_timeout(void)
+{
+	uint8_t sel = next_u8();
+
+	switch (sel % 4) {
+	case 0:
+		return K_NO_WAIT;
+	case 1:
+		return K_TICKS(1 + (sel >> 2) % 3);
+	case 2:
+		return K_FOREVER;
+	default:
+		/* Raw: huge, negative and (with TIMEOUT_64BIT) absolute timeouts */
+		return (k_timeout_t){ .ticks = (k_ticks_t)(int32_t)next_u32() };
+	}
+}
+
+struct k_thread *fz_thread(void)
+{
+	uint8_t sel = next_u8();
+
+	switch (sel % 8) {
+	case 0:
+		return k_current_get();
+	case 1:
+	case 2:
+		return &workers[(sel % 8 - 1) % NUM_WORKERS];
+	case 3:
+		return &dormant_thread;
+	case 4:
+		return &dead_thread;
+	case 5:
+		return main_tid;		/* no permission */
+	case 6:
+		return NULL;
+	default:
+		return (struct k_thread *)(uintptr_t)next_u32();
+	}
+}
+
+void fz_child_entry(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	k_sleep(K_TICKS((uintptr_t)p1 % 4));
+}
+
+static void dead_entry(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+}
+
+/* Raw op bytes (checked before the group sees them) for CONFIG_SYSCALL_FUZZ_SELFTEST */
 #define OP_SELFTEST_PANIC 0xF0
 #define OP_SELFTEST_FAULT 0xF1
 #define OP_SELFTEST_ASSERT 0xF2
-K_APP_BMEM(fz_part) static uint8_t selftest_op;
 
-/*
- * OP_POLL encoding:
- *   u8  number of events present in the payload (mod MAX_EVENTS + 1)
- *   u8  flags: bit0 raw num_events (u32 follows)
- *              bit1 replace events pointer: bit2 ? raw u32 : kernel address
- *   n * { sizeof(struct k_poll_event) raw bytes, u8 object selector }
- *   u8  timeout in ticks (mod 3; 0 is K_NO_WAIT)
- */
-static void do_poll(void)
-{
-	uint8_t n = next_u8() % (MAX_EVENTS + 1);
-	uint8_t flags = next_u8();
-	struct k_poll_event *ev = events;
-	int num = n;
-
-	for (int i = 0; i < n; i++) {
-		uint8_t *raw = (uint8_t *)&events[i];
-		uint8_t sel;
-
-		for (size_t j = 0; j < sizeof(events[i]); j++) {
-			raw[j] = next_u8();
-		}
-		/* Out-of-range selectors keep the raw pointer from the payload */
-		sel = next_u8();
-		if (sel < ARRAY_SIZE(objs)) {
-			events[i].obj = objs[sel];
-		}
-	}
-
-	if (flags & BIT(0)) {
-		num = (int)next_u32();
-	}
-	if (flags & BIT(1)) {
-		ev = (flags & BIT(2)) ? (struct k_poll_event *)(uintptr_t)next_u32()
-				      : (struct k_poll_event *)&afl_input;
-	}
-
-	(void)k_poll(ev, num, K_TICKS(next_u8() % 3));
-}
-
+/* Worker entry. Coverage (AFL_RENODE_COVERAGE=window) starts here. */
 static void user_entry(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1);
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	while (upos < ulen) {
-		op_offset = upos;
+	while (fz_mem.upos < fz_mem.ulen && fz_mem.upos < AFL_INPUT_MAX) {
+		fz_mem.op_offset = fz_mem.upos;
 		uint8_t op = next_u8();
 
-		cur_op = op;
+		fz_mem.cur_op = op;
 
 		if (IS_ENABLED(CONFIG_SYSCALL_FUZZ_SELFTEST) &&
 		    (op == OP_SELFTEST_PANIC || op == OP_SELFTEST_FAULT ||
 		     op == OP_SELFTEST_ASSERT)) {
-			selftest_op = op;
+			fz_mem.selftest_op = op;
+			fz_mem.upos = fz_mem.ulen;
 			return;
 		}
 
-		switch (op % OP_COUNT) {
-		case OP_POLL:
-			do_poll();
-			break;
-		case OP_SEM_GIVE:
-			k_sem_give(&fz_sem);
-			break;
-		case OP_SEM_TAKE:
-			(void)k_sem_take(&fz_sem, K_NO_WAIT);
-			break;
-		case OP_SIGNAL_RAISE:
-			(void)k_poll_signal_raise(&fz_signal, (int)next_u32());
-			break;
-		case OP_SIGNAL_RESET:
-			k_poll_signal_reset(&fz_signal);
-			break;
-		case OP_MSGQ_PUT:
-			for (int i = 0; i < 4; i++) {
-				scratch[i] = next_u8();
-			}
-			(void)k_msgq_put(&fz_msgq, scratch, K_NO_WAIT);
-			break;
-		case OP_MSGQ_GET:
-			(void)k_msgq_get(&fz_msgq, scratch, K_NO_WAIT);
-			break;
-		case OP_MSGQ_PURGE:
-			k_msgq_purge(&fz_msgq);
-			break;
-		case OP_QUEUE_APPEND:
-			(void)k_queue_alloc_append(&fz_queue, &scratch[next_u8() % 16]);
-			break;
-		case OP_QUEUE_GET:
-			(void)k_queue_get(&fz_queue, K_NO_WAIT);
-			break;
-		case OP_PIPE_WRITE: {
-			uint8_t len = next_u8() % sizeof(scratch);
-
-			for (int i = 0; i < len; i++) {
-				scratch[i] = next_u8();
-			}
-			(void)k_pipe_write(&fz_pipe, scratch, len, K_NO_WAIT);
-			break;
-		}
-		case OP_PIPE_READ:
-			(void)k_pipe_read(&fz_pipe, scratch, next_u8() % sizeof(scratch), K_NO_WAIT);
-			break;
-		case OP_PIPE_RESET:
-			k_pipe_reset(&fz_pipe);
-			break;
-		default:
-			break;
-		}
+		group_op(op);
 	}
 }
 
@@ -281,8 +278,8 @@ static void record_crash(unsigned int reason, const struct arch_esf *esf)
 	afl_crash.ifsr = __get_IFSR();
 	afl_crash.ifar = __get_IFAR();
 #endif
-	afl_crash.op_offset = op_offset;
-	afl_crash.op = cur_op;
+	afl_crash.op_offset = fz_mem.op_offset;
+	afl_crash.op = fz_mem.cur_op;
 	afl_crash.magic = AFL_CRASH_MAGIC;
 }
 
@@ -308,7 +305,7 @@ void k_sys_fatal_error_handler(unsigned int reason, const struct arch_esf *esf)
 	 * fault in user mode is the user thread's own problem. Both are expected;
 	 * returning lets the kernel abort the thread and the supervisor carry on.
 	 */
-	if (k_current_get() == &user_thread &&
+	if ((k_current_get()->base.user_options & K_USER) != 0 &&
 	    (reason == K_ERR_KERNEL_OOPS || user_fault)) {
 		/* A user-context assertion is not a kernel bug either */
 		afl_crash.assert_file = 0;
@@ -319,6 +316,67 @@ void k_sys_fatal_error_handler(unsigned int reason, const struct arch_esf *esf)
 	afl_bug(reason);
 	(void)arch_irq_lock();
 	for (;;) {
+	}
+}
+
+static void hang(void)
+{
+	record_crash(0xFFFFFFFFU, NULL);
+	afl_hang();
+	for (;;) {
+		k_sleep(K_FOREVER);
+	}
+}
+
+/*
+ * Waits until the input is consumed and no worker can run any more (all are
+ * dead, pending or suspended). Workers blocked forever, or deadlocked on each
+ * other, are a user-level outcome, not a kernel bug: if no worker can run for
+ * IDLE_TICKS consecutive ticks the run is over. A worker that is still
+ * runnable after HANG_MS is a hang (e.g. a kernel livelock). The supervisor has
+ * a higher priority than any user thread (users cannot raise theirs above
+ * their own), so it gets to run every tick.
+ */
+static void supervise(void)
+{
+	const uint8_t blocked = _THREAD_PENDING | _THREAD_SLEEPING | _THREAD_SUSPENDED |
+				_THREAD_DEAD;
+	int64_t deadline = k_uptime_get() + HANG_MS;
+	int idle = 0;
+
+	uint32_t last_pos = 0;
+
+	for (;;) {
+		bool alive = false, runnable = false;
+
+		/*
+		 * A syscall wrote over the stream state (through a raw pointer):
+		 * the input would be replayed or overrun, so the run is over. This
+		 * is deterministic, so AFL just sees a shorter run.
+		 */
+		if (fz_mem.ulen != klen || fz_mem.upos < last_pos || fz_mem.upos > klen) {
+			return;
+		}
+		last_pos = fz_mem.upos;
+
+		for (int i = 0; i < NUM_WORKERS; i++) {
+			uint8_t state = workers[i].base.thread_state;
+
+			alive |= (state & _THREAD_DEAD) == 0;
+			runnable |= (state & blocked) == 0;
+		}
+		if (!alive) {
+			return;
+		}
+		if (runnable) {
+			idle = 0;
+			if (k_uptime_get() > deadline) {
+				hang();
+			}
+		} else if (fz_mem.upos >= fz_mem.ulen || ++idle > IDLE_TICKS) {
+			return;
+		}
+		k_sleep(K_TICKS(1));
 	}
 }
 
@@ -334,33 +392,52 @@ int main(void)
 		return 0;
 	}
 
-	memcpy(ubuf, afl_input.data, afl_input.len);
-	ulen = afl_input.len;
-	upos = 0;
+	memcpy(fz_mem.ubuf, afl_input.data, afl_input.len);
+	fz_mem.ulen = afl_input.len;
+	fz_mem.upos = 0;
+	klen = afl_input.len;
+	main_tid = k_current_get();
 
 	k_mem_domain_init(&fz_domain, ARRAY_SIZE(parts), parts);
-	k_thread_create(&user_thread, user_stack, USER_STACK_SIZE, user_entry,
-			NULL, NULL, NULL, K_PRIO_PREEMPT(1), K_USER, K_FOREVER);
-	k_mem_domain_add_thread(&fz_domain, &user_thread);
-	k_thread_access_grant(&user_thread, &fz_sem, &fz_msgq, &fz_queue, &fz_pipe,
-			      &fz_signal);
-	k_thread_heap_assign(&user_thread, &fz_heap);
-	k_thread_start(&user_thread);
 
-	if (k_thread_join(&user_thread, K_MSEC(500)) != 0) {
-		record_crash(0xFFFFFFFFU, NULL);
-		afl_hang();
-		return 0;
+	k_thread_create(&dead_thread, dead_stack, K_THREAD_STACK_SIZEOF(dead_stack),
+			dead_entry, NULL, NULL, NULL, K_PRIO_PREEMPT(1), K_USER, K_FOREVER);
+	k_mem_domain_add_thread(&fz_domain, &dead_thread);
+	k_thread_start(&dead_thread);
+	k_thread_join(&dead_thread, K_FOREVER);
+
+	k_thread_create(&dormant_thread, dormant_stack, K_THREAD_STACK_SIZEOF(dormant_stack),
+			fz_child_entry, NULL, NULL, NULL, K_PRIO_PREEMPT(2), K_USER, K_FOREVER);
+	k_mem_domain_add_thread(&fz_domain, &dormant_thread);
+
+	for (int i = 0; i < NUM_WORKERS; i++) {
+		k_thread_create(&workers[i], worker_stacks[i], USER_STACK_SIZE, user_entry,
+				NULL, NULL, NULL, K_PRIO_PREEMPT(1), K_USER, K_FOREVER);
+		k_mem_domain_add_thread(&fz_domain, &workers[i]);
+		k_thread_heap_assign(&workers[i], &fz_heap);
 	}
+	for (int i = 0; i < NUM_WORKERS; i++) {
+		for (int j = 0; j < NUM_WORKERS; j++) {
+			k_object_access_grant(&workers[j], &workers[i]);
+		}
+		k_object_access_grant(&dormant_thread, &workers[i]);
+		k_object_access_grant(&dead_thread, &workers[i]);
+	}
+	group_setup();
+
+	for (int i = 0; i < NUM_WORKERS; i++) {
+		k_thread_start(&workers[i]);
+	}
+	supervise();
 
 	if (IS_ENABLED(CONFIG_SYSCALL_FUZZ_SELFTEST)) {
-		if (selftest_op == OP_SELFTEST_PANIC) {
+		if (fz_mem.selftest_op == OP_SELFTEST_PANIC) {
 			k_panic();
-		} else if (selftest_op == OP_SELFTEST_FAULT) {
+		} else if (fz_mem.selftest_op == OP_SELFTEST_FAULT) {
 			/* Kernel-mode access to unmapped memory */
 			(void)*(volatile uint32_t *)0xF0000000;
 		}
-		__ASSERT(selftest_op != OP_SELFTEST_ASSERT, "selftest assertion");
+		__ASSERT(fz_mem.selftest_op != OP_SELFTEST_ASSERT, "selftest assertion");
 	}
 
 	afl_done();

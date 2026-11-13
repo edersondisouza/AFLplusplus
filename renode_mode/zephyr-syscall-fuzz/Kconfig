@@ -1,5 +1,64 @@
 # SPDX-License-Identifier: Apache-2.0
 
+choice SYSCALL_FUZZ_GROUP
+	prompt "Syscall group to fuzz"
+	default SYSCALL_FUZZ_GROUP_POLL
+	help
+	  Each group interprets the input with its own set of operations;
+	  see src/group_*.c. Select a group with groups/<name>.conf, which
+	  also enables the kernel features the group needs.
+
+config SYSCALL_FUZZ_GROUP_POLL
+	bool "k_poll and the objects it waits on"
+
+config SYSCALL_FUZZ_GROUP_OBJECTS
+	bool "Dynamic kernel objects, permissions, thread stacks, events, condvars"
+
+config SYSCALL_FUZZ_GROUP_FUTEX
+	bool "Futexes, sys_mutex and the less used k_msgq/k_queue calls"
+
+config SYSCALL_FUZZ_GROUP_THREAD
+	bool "Thread attributes: names, deadlines, stack info, custom data"
+
+endchoice
+
+config SYSCALL_FUZZ_WORKERS
+	int "User threads interpreting the input"
+	default 1 if SYSCALL_FUZZ_GROUP_POLL
+	default 2
+	range 1 4
+	help
+	  All workers consume the same input. When one blocks in a syscall the
+	  next one runs, so blocking calls can be woken up by later operations.
+
+config SYSCALL_FUZZ_HEAP_SIZE
+	int "Resource pool of the workers, in bytes"
+	default 16384 if SYSCALL_FUZZ_GROUP_OBJECTS
+	default 4096
+	help
+	  Kernel heap assigned to the workers with k_thread_heap_assign().
+	  Dynamic objects, user thread stacks and k_*_alloc_* buffers come from
+	  it, so running out of memory is deterministic and does not depend on
+	  what the rest of the system allocated.
+
+config SYSCALL_FUZZ_SKIP_KNOWN_BUGS
+	bool "Do not feed inputs that trigger already known kernel bugs"
+	default y
+	help
+	  Skips syscalls whose arguments are known to trigger kernel bugs
+	  already found by this harness (see known-bugs/ and README.renode),
+	  so that long campaigns are not swamped by variants of them:
+	  k_thread_create() with a stack too small for TLS/initial frame
+	  (kernel writes below the stack object), k_msgq_alloc_init()
+	  with msg_size 0 (assert in put_msg_in_queue()), releasing a dynamic
+	  k_msgq/k_stack that was never initialized (k_free() of stale heap
+	  contents) and user threads deadlocking on k_mutex (assertion from
+	  MUTEX_DEADLOCK_DETECT). Disable to reproduce them.
+
+# User threads deadlocking on k_mutex trip an assertion, see above
+config MUTEX_DEADLOCK_DETECT
+	default n if SYSCALL_FUZZ_SKIP_KNOWN_BUGS
+
 config SYSCALL_FUZZ_SELFTEST
 	bool "Harness self-test operations"
 	help
