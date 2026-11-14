@@ -7,11 +7,9 @@ mach create "syscall-fuzz"
 machine LoadPlatformDescription $ORIGIN/cortex_r8_virtual.repl
 cpu PerformanceInMips 50
 
-macro reset
-"""
-    sysbus LoadELF $elf
-"""
-runMacro $reset
+# Loaded once: no "reset" macro, as LoadELF leaks ~175 KB of Renode memory per
+# call. afl_syscall.py restores the loaded image itself after each reset.
+sysbus LoadELF $elf
 
 emulation SetGlobalQuantum "0.001"
 emulation SetGlobalAdvanceImmediately true

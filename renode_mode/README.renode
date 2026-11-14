@@ -102,7 +102,9 @@ zephyr-syscall-fuzz/; it is built for one syscall group at a time (see
       renode_mode/zephyr-syscall-fuzz -- -DEXTRA_CONF_FILE=groups/poll.conf
 
 Each test case is written into the guest's afl_input buffer right after
-a machine reset (afl_renode.always_reset), and a run ends when the guest
+a machine reset (afl_renode.always_reset; the ELF is loaded once and its
+LOAD segments are written back after each reset, see "Renode memory"
+below), and a run ends when the guest
 calls afl_done (success), afl_bug (kernel fault/panic/assert, reported
 as SIGABRT) or afl_hang, or when the host watchdog expires after
 AFL_RENODE_MAX_QUANTA quanta.  User thread oopses are expected and are
@@ -199,7 +201,31 @@ stay replayable after rebuilds:
       thread=$B-thread/zephyr/zephyr.elf
 
 -n prints the commands without running them.  Each instance is one
-afl-fuzz plus one Renode process (~1 core).
+afl-fuzz plus one Renode process (~1 core, ~350-450 MB RSS).  Instances
+run detached (setsid) in the background and campaign.sh returns at once
+(-w waits and prints the status at the end); OUT/<group>/<name>.pid and
+.log are kept per instance, and OUT/campaign.conf holds the deadline.
+Other modes act on a running campaign:
+
+  campaign.sh -S OUT               status of every instance
+  campaign.sh -R OUT GROUP/NAME..  restart dead instances, resuming their
+                                   queue (-i -) for the time left
+  campaign.sh -K OUT               stop all instances
+
+watchdog.py OUT monitors a campaign: every --interval seconds it samples
+the instances (fuzzer_stats, Renode RSS, disk space) into
+OUT/metrics.csv, and it exits when something needs attention: 0 when the
+campaign is over, 3 on events (an instance died, Renode RSS above
+--rss-mb or grown by --rss-growth-mb, exec/s below --min-eps, stats
+stalled, new crashes/hangs, low disk), 4 for a periodic report
+(--report-hours).  New crashes are grouped by signature (assertion, or
+fault reason and PC from crash-info/) with an example input.  Each event
+is reported once (OUT/watchdog.ack), so it can simply be run again after
+handling it; touch OUT/<group>/<name>.retired to stop watching an
+instance.  The intended loop, e.g. from an agent session: start the
+campaign detached, run watchdog.py in the foreground, on exit triage
+(replay.sh on the group's copied ELF), restart with -R if needed, and
+run watchdog.py again.
 
 Disk usage: the output defaults to $HOME/zfuzz/<date> (or
 $ZFUZZ_CAMPAIGNS/<date>), and campaign.sh warns if OUT is under /tmp.
@@ -225,7 +251,7 @@ Challenges and how they were handled
   when the kernel itself stops making progress.
 
 * Object handles.  Syscalls take kernel object pointers that must be in
-  the kernel object table and   granted.  Inputs mostly select from per-group handle tables (static
+  the kernel object table and granted.  Inputs mostly select from per-group handle tables (static
   granted objects, objects not granted to the caller, objects of the
   wrong type, dynamic slots filled by k_object_alloc, NULL), with a raw
   u32 pointer as just one of the choices, so most inputs get past the
@@ -257,6 +283,19 @@ Challenges and how they were handled
 
 * Separate heap.  K_HEAP fz_heap (SYSCALL_FUZZ_HEAP_SIZE) is the user
   threads' resource pool, so out-of-memory paths are deterministic.
+
+* Renode memory.  The first test campaign showed every Renode growing by
+  ~200 MB/min (85 KB per test case), i.e. out of memory within hours.
+  The cause was the resc "reset" macro reloading the ELF on every
+  Machine.Reset(): LoadELF leaks ~175 KB of managed memory per call in
+  Renode 1.17 (reset alone: a few KB, levelling off).  The ELF is now
+  loaded once; afl_syscall.py snapshots its LOAD segments (with the
+  zeroed .bss) and the entry PC before the first run and writes them
+  back after each reset.  Renode now stays at ~350-450 MB and exec/s
+  went up ~20%.  Machine.Reset() also drops the symbols LoadELF added,
+  so the harness keeps the addresses it needs and reloads the symbols
+  (LoadSymbolsFrom) only when decoding a failure.  watchdog.py still
+  watches RSS in case of other leaks.
 
 * Coverage is verified, not assumed: replay_corpus.py -e dumps the
   edges of the seeds; each seed was checked to reach the kernel
@@ -295,8 +334,23 @@ them with replay.sh on a build with CONFIG_SYSCALL_FUZZ_SKIP_KNOWN_BUGS=n):
   it should probably return an error to user mode instead.
   (kmutex-deadlock-assert, futex-kmutex build)
 
+* Dynamically allocated user stacks look too big to the verifier:
+  for k_thread_stack_alloc(K_USER) / k_object_alloc_size(
+  K_OBJ_THREAD_STACK_ELEMENT), dynamic_object_create() records the whole
+  allocation (z_stack_data, privileged stack, alignment padding and the
+  stack) as the object size, so z_vrfy_k_thread_create() accepts a
+  stack_size well beyond what was requested (e.g. 1536 on a 512 byte
+  stack) and the user stack region then covers the thread's own
+  privileged stack.  On cortex_r8_virtual the oversized region is also
+  not aligned to its (power of two) size, and the new thread takes a
+  permission fault on its first instruction (K_ERR_ARM_PERMISSION_FAULT
+  in z_thread_entry); with an MPU without that constraint it would give
+  user mode write access to the privileged stack.
+  (thread-create-dyn-stack-oversize)
+
 CONFIG_SYSCALL_FUZZ_SKIP_KNOWN_BUGS (default y) avoids them so long
 campaigns are not filled with variants: too small stacks and msg_size 0
-are not passed, dynamic msgq/stack objects are initialized right after
-allocation (the INIT op then fails on them), and MUTEX_DEADLOCK_DETECT
-defaults to n.  The stream format is the same either way.
+are not passed, threads are not created on dynamic stacks with a size
+above the one allocated, dynamic msgq/stack objects are initialized
+right after allocation (the INIT op then fails on them), and
+MUTEX_DEADLOCK_DETECT defaults to n.  The stream format is the same either way.

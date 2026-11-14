@@ -28,6 +28,9 @@ K_SEM_DEFINE(ungranted_sem, 0, 1);
 
 K_APP_BMEM(fz_part) static void *slot[NUM_SLOTS];
 K_APP_BMEM(fz_part) static k_thread_stack_t *stk[NUM_STACKS];
+/* Requested sizes of the dynamic stacks in slot[] and stk[] (SKIP_KNOWN_BUGS) */
+K_APP_BMEM(fz_part) static size_t slot_stack_size[NUM_SLOTS];
+K_APP_BMEM(fz_part) static size_t stk_size[NUM_STACKS];
 K_APP_BMEM(fz_part) static uint32_t evset;
 
 static const enum k_objects types[] = {
@@ -270,6 +273,29 @@ static void do_event_set(void)
  */
 #define KNOWN_BUG_MIN_STACK 128
 
+/*
+ * Known bug: for a dynamically allocated user stack (k_thread_stack_alloc()
+ * with K_USER, or k_object_alloc_size(K_OBJ_THREAD_STACK_ELEMENT)) the
+ * object's size is the whole allocation, privileged stack included, so
+ * k_thread_create() accepts a stack_size larger than the one requested and
+ * the user stack region covers the privileged stack. Returns the size
+ * requested for s if it is one of ours, else SIZE_MAX.
+ */
+static size_t dyn_stack_size(const void *s)
+{
+	for (int i = 0; i < NUM_STACKS; i++) {
+		if (s != NULL && s == stk[i]) {
+			return stk_size[i];
+		}
+	}
+	for (int i = 0; i < NUM_SLOTS; i++) {
+		if (s != NULL && s == slot[i]) {
+			return slot_stack_size[i];
+		}
+	}
+	return SIZE_MAX;
+}
+
 static void do_thread_create(void)
 {
 	struct k_thread *t = obj();
@@ -280,7 +306,8 @@ static void do_thread_create(void)
 	uintptr_t ticks = next_u8();
 	k_timeout_t delay = fz_timeout();
 
-	if (IS_ENABLED(CONFIG_SYSCALL_FUZZ_SKIP_KNOWN_BUGS) && size < KNOWN_BUG_MIN_STACK) {
+	if (IS_ENABLED(CONFIG_SYSCALL_FUZZ_SKIP_KNOWN_BUGS) &&
+	    (size < KNOWN_BUG_MIN_STACK || size > dyn_stack_size(s))) {
 		return;
 	}
 	(void)k_thread_create(t, s, size, fz_child_entry, (void *)ticks, NULL, NULL,
@@ -303,13 +330,16 @@ void group_op(uint8_t op)
 		enum k_objects t = otype();
 
 		slot[i] = alloced(k_object_alloc(t), t);
+		slot_stack_size[i] = SIZE_MAX;
 		break;
 	}
 	case OP_ALLOC_SIZE: {
 		uint8_t i = next_u8() % NUM_SLOTS;
 		enum k_objects t = otype();
+		size_t size = fz_len();
 
-		slot[i] = alloced(k_object_alloc_size(t, fz_len()), t);
+		slot[i] = alloced(k_object_alloc_size(t, size), t);
+		slot_stack_size[i] = t == K_OBJ_THREAD_STACK_ELEMENT ? size : SIZE_MAX;
 		break;
 	}
 	case OP_RELEASE:
@@ -378,6 +408,7 @@ void group_op(uint8_t op)
 		size_t size = fz_len();
 
 		stk[i] = k_thread_stack_alloc(size, next_u8() & K_USER);
+		stk_size[i] = size;
 		break;
 	}
 	case OP_STACK_FREE:

@@ -49,7 +49,9 @@ config SYSCALL_FUZZ_SKIP_KNOWN_BUGS
 	  already found by this harness (see known-bugs/ and README.renode),
 	  so that long campaigns are not swamped by variants of them:
 	  k_thread_create() with a stack too small for TLS/initial frame
-	  (kernel writes below the stack object), k_msgq_alloc_init()
+	  (kernel writes below the stack object) or larger than the dynamic
+	  user stack it runs on (the verifier counts the privileged stack
+	  in the object size), k_msgq_alloc_init()
 	  with msg_size 0 (assert in put_msg_in_queue()), releasing a dynamic
 	  k_msgq/k_stack that was never initialized (k_free() of stale heap
 	  contents) and user threads deadlocking on k_mutex (assertion from

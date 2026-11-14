@@ -219,10 +219,60 @@ def flush_edge_log():
         del edges_new[:]
 
 
+image = []
+image_pcs = []
+crash_addrs = set()
+
+
+def elf_load_ranges(path):
+    '''(address, memsz) of the PT_LOAD segments of a 32-bit little-endian ELF'''
+    with open(path, "rb") as f:
+        ehdr = f.read(52)
+        if ehdr[:4] != b"\x7fELF" or ehdr[4:6] != b"\x01\x01":
+            raise ValueError("%s: not a 32-bit little-endian ELF" % path)
+        phoff, = struct.unpack_from("<I", ehdr, 28)
+        phentsize, phnum = struct.unpack_from("<HH", ehdr, 42)
+        ranges = []
+        for i in range(phnum):
+            f.seek(phoff + i * phentsize)
+            p_type, _, _, p_paddr, _, p_memsz = struct.unpack("<6I", f.read(24))
+            if p_type == 1 and p_memsz:
+                ranges.append((p_paddr, p_memsz))
+    return ranges
+
+
+def snapshot_image():
+    '''Saves the freshly loaded ELF (with zeroed .bss) and the entry PCs.
+
+    The resc loads the ELF once: reloading it on every reset (a "reset" macro
+    running LoadELF) leaks ~175 KB of Renode memory per test case, gigabytes
+    per hour per instance.'''
+    elf = os.environ.get("AFL_RENODE_ELF")
+    if not elf:
+        raise ValueError("AFL_RENODE_ELF not set: pass the ELF to afl-renode-trace")
+    bus, _ = bus_and_cpu()
+    crash_addrs.update(afl_renode.symbol_addresses("afl_crash"))
+    for addr, size in elf_load_ranges(elf):
+        image.append((addr, bus.ReadBytes(System.UInt64(addr), size)))
+    image_pcs.extend(cpu.PC for cpu in bus.GetCPUs())
+
+
+def restore_image():
+    bus = monitor.Machine[sysbus_name]
+    for addr, blob in image:
+        bus.WriteBytes(blob, System.UInt64(addr))
+    for cpu, pc in zip(bus.GetCPUs(), image_pcs):
+        cpu.PC = pc
+
+
 def do_one_child():
     global started, quanta
     _orig_do_one_child()
     quanta = 0
+    if not started:
+        snapshot_image()
+    else:
+        restore_image()
     write_input(read_input())
 
     if COVERAGE == "all":
@@ -253,6 +303,17 @@ def bus_and_cpu():
     return bus, list(bus.GetCPUs())[0]
 
 
+def ensure_symbols():
+    '''Machine.Reset() drops the symbols LoadELF added; reload them for decoding.
+
+    Only on failures: like LoadELF, this would leak if done for every run.'''
+    bus, cpu = bus_and_cpu()
+    try:
+        bus.GetAllSymbolAddresses("user_entry", cpu)
+    except Exception:
+        monitor.Parse("sysbus LoadSymbolsFrom @%s" % os.environ["AFL_RENODE_ELF"])
+
+
 def symbolize(addr):
     bus, cpu = bus_and_cpu()
     try:
@@ -277,7 +338,8 @@ def describe_failure(status):
                                            .get(status, "other")),
              "input: %d bytes, sha1 %s" % (len(last_input),
                                            hashlib.sha1(last_input).hexdigest())]
-    addrs = afl_renode.symbol_addresses("afl_crash")
+    ensure_symbols()
+    addrs = crash_addrs or afl_renode.symbol_addresses("afl_crash")
     if not addrs:
         return lines + ["no afl_crash symbol in this ELF"]
     bus, _ = bus_and_cpu()
