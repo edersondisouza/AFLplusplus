@@ -15,6 +15,11 @@ fuzzer_stats) into OUT/metrics.csv and checks for:
   stall      fuzzer_stats not updated for --stall seconds
   crash/hang new files in crashes/ or hangs/ (with their crash record)
   disk       less than --disk-gb free for OUT or --tmp-disk-gb for /tmp
+  supervisor a new line in OUT/actions.log, or no supervisor running
+
+While the supervisor (--supervise, started by campaign.sh) runs, it handles
+dead and stalled instances itself, so those are reported only through its
+actions (restart, kill, gave up).
 
 Each event is reported once: its key is appended to OUT/watchdog.ack and
 the event to OUT/events.log. Exit status:
@@ -33,6 +38,8 @@ import csv
 import hashlib
 import os
 import shutil
+import signal
+import subprocess
 import sys
 import time
 
@@ -155,6 +162,19 @@ class Watchdog:
         alive_any = False
         rows = []
         crashes = collections.defaultdict(list)
+        supervised, sup_pid = supervisor_alive(self.out)
+        if supervised:
+            try:
+                with open(os.path.join(self.out, "actions.log")) as f:
+                    for line in f:
+                        line = line.rstrip("\n")
+                        events.append((f"action {line}", f"supervisor: {line}", []))
+            except OSError:
+                pass
+        elif now < self.deadline - 2 * a.interval:
+            events.append((f"nosupervisor {sup_pid}",
+                           "supervisor: not running, dead instances will not be restarted "
+                           "(campaign.sh -P OUT)", []))
         for g, n in self.instances():
             gdir = os.path.join(self.out, g)
             inst = f"{g}/{n}"
@@ -186,7 +206,7 @@ class Watchdog:
                                        f"({self.first_rss[rpid]} -> {rss} MB)", []))
                 if st:
                     age = now - int(st.get("last_update", now))
-                    if age > a.stall:
+                    if age > a.stall and not supervised:
                         events.append((f"stall {inst} {pid}",
                                        f"stall: {inst} fuzzer_stats not updated for {age:.0f}s", []))
                     eps = float(st.get("execs_ps_last_min", st.get("execs_per_sec", 0)))
@@ -197,7 +217,7 @@ class Watchdog:
                                            f"slow: {inst} {eps} exec/s (last min), load {load1:.1f}", []))
                     else:
                         self.slow[pid] = 0
-            elif now < self.deadline - 2 * a.interval:
+            elif now < self.deadline - 2 * a.interval and not supervised:
                 events.append((f"dead {inst} {pid}", f"dead: {inst} afl-fuzz {pid} exited "
                                f"{(self.deadline - now) / 3600:.1f} h before the end",
                                tail(os.path.join(gdir, n + ".log"), 6)))
@@ -282,6 +302,90 @@ class Watchdog:
             time.sleep(a.interval)
 
 
+class Supervisor(Watchdog):
+    '''Keeps a campaign running unattended until its deadline.
+
+    Restarts instances that died (at most --max-restarts per instance per
+    hour) and SIGKILLs a Renode whose heartbeat file is older than --stall
+    seconds, so that its afl-fuzz exits and is restarted. Every action is
+    appended to OUT/actions.log, which the reporting watchdog turns into
+    events.'''
+
+    def act(self, msg, detail=()):
+        line = f"{time.strftime('%F %T')} {msg}"
+        print(line, flush=True)
+        for d in detail:
+            print("    " + d, flush=True)
+        with open(os.path.join(self.out, "actions.log"), "a") as f:
+            f.write(line + "\n")
+
+    def run(self):
+        a = self.a
+        campaign = os.path.join(os.path.dirname(os.path.abspath(__file__)), "campaign.sh")
+        restarts = collections.defaultdict(list)
+        given_up = set()
+        self.act(f"supervisor {os.getpid()} up, {(self.deadline - time.time()) / 3600:.1f} h left")
+        while True:
+            now = time.time()
+            alive_any = False
+            for g, n in self.instances():
+                gdir = os.path.join(self.out, g)
+                inst = f"{g}/{n}"
+                if os.path.exists(os.path.join(gdir, n + ".retired")):
+                    continue
+                pidfile = os.path.join(gdir, n + ".pid")
+                try:
+                    with open(pidfile) as f:
+                        pid = int(f.read())
+                    started = os.path.getmtime(pidfile)
+                except (OSError, ValueError):
+                    continue
+                if afl_alive(pid):
+                    alive_any = True
+                    try:
+                        beat = os.path.getmtime(os.path.join(gdir, n + ".alive"))
+                    except OSError:
+                        beat = 0
+                    age = now - max(beat, started)
+                    rpid = renode_pid(pid)
+                    if age > a.stall and rpid:
+                        try:
+                            os.kill(rpid, signal.SIGKILL)
+                            self.act(f"killed {inst} Renode {rpid}: no heartbeat for {age:.0f}s")
+                        except OSError as e:
+                            self.act(f"cannot kill {inst} Renode {rpid}: {e}")
+                    continue
+                if now >= self.deadline - 2 * a.interval or inst in given_up:
+                    continue
+                recent = [t for t in restarts[inst] if now - t < 3600]
+                restarts[inst] = recent
+                log = tail(os.path.join(gdir, n + ".log"), 3)
+                if len(recent) >= a.max_restarts:
+                    given_up.add(inst)
+                    self.act(f"gave up on {inst}: {len(recent)} restarts in the last hour", log)
+                    continue
+                r = subprocess.run([campaign, "-R", self.out, inst],
+                                   capture_output=True, text=True)
+                restarts[inst].append(now)
+                self.act(f"restart {inst} (afl-fuzz {pid} died): "
+                         f"{(r.stdout + r.stderr).strip() or r.returncode}", log)
+                alive_any = True
+            if not alive_any and now >= self.deadline - 2 * a.interval:
+                self.act("supervisor done: campaign over")
+                return 0
+            time.sleep(a.interval)
+
+
+def supervisor_alive(out):
+    try:
+        with open(os.path.join(out, "supervisor.pid")) as f:
+            pid = int(f.read())
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return b"--supervise" in f.read(), pid
+    except (OSError, ValueError):
+        return False, None
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -301,7 +405,12 @@ def main():
     p.add_argument("--tmp-disk-gb", type=float, default=2, help="minimum free GB in /tmp (2)")
     p.add_argument("--report-hours", type=float, default=0,
                    help="exit with a status report after this many hours (off)")
-    sys.exit(Watchdog(p.parse_args()).run())
+    p.add_argument("--supervise", action="store_true",
+                   help="run as the campaign supervisor instead (see campaign.sh)")
+    p.add_argument("--max-restarts", type=int, default=5,
+                   help="supervisor: restarts per instance per hour before giving up (5)")
+    args = p.parse_args()
+    sys.exit((Supervisor if args.supervise else Watchdog)(args).run())
 
 
 if __name__ == "__main__":

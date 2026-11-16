@@ -7,6 +7,7 @@
 #   campaign.sh -R OUT GROUP/INSTANCE...   restart (resume) instances
 #   campaign.sh -S OUT                     status of every instance
 #   campaign.sh -K OUT                     stop every instance
+#   campaign.sh -P OUT                     (re)start the supervisor
 #
 #   GROUP=ELF  campaign name and zephyr.elf built for it, e.g.
 #              objects=../build-g-objects/zephyr/zephyr.elf
@@ -28,7 +29,13 @@
 # against the exact binary (see replay.sh). Every instance writes
 # OUT/<GROUP>/<INSTANCE>.log and crash records to OUT/<GROUP>/crash-info/.
 # -R resumes an instance from its AFL output directory (afl-fuzz -i -)
-# for the rest of the campaign time; see watchdog.sh for monitoring.
+# for the rest of the campaign time; see watchdog.py for monitoring.
+#
+# A supervisor (watchdog.py --supervise, pid in OUT/supervisor.pid, log in
+# OUT/supervisor.log) runs detached alongside the instances until the end:
+# it restarts instances that die and kills a Renode whose heartbeat
+# (OUT/<GROUP>/<INSTANCE>.alive) goes stale, so the campaign survives
+# unattended. -K stops it before the instances.
 #
 # Everything a campaign writes stays in OUT, including Renode/dotnet
 # temporary files (TMPDIR=OUT/tmp), so long campaigns do not fill /tmp.
@@ -40,7 +47,7 @@ afl_root=$(readlink -f "$here/../..")
 resc=$afl_root/renode_mode/example-syscall.resc
 
 usage() {
-    sed -n '4,36s/^# \{0,1\}//p' "$0" >&2
+    sed -n '4,41s/^# \{0,1\}//p' "$0" >&2
     exit 1
 }
 
@@ -64,10 +71,16 @@ start_instance() {        # OUT GROUP NAME resume
     fi
     if [ "$name" = main ]; then role=(-M main); else role=(-S "$name"); fi
     if [ "$resume" = 1 ]; then input=-; else input=$(cat "$dir/seeds"); fi
+    # Renode is both fork server and target, and reports its own pid as the
+    # child, so on a timeout afl-fuzz would SIGKILL Renode and abort. Make
+    # that kill a SIGCONT (a no-op) while keeping SIGTERM for shutdown; the
+    # harness ends runs itself after AFL_RENODE_MAX_WALL (10 s) < -t.
     local cmd=(env TMPDIR=$out/tmp AFL_NO_UI=1 AFL_SKIP_CPUFREQ=1 AFL_SKIP_BIN_CHECK=1
          AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 AFL_FORKSRV_INIT_TMOUT=600000
+         AFL_KILL_SIGNAL=18 AFL_FORK_SERVER_KILL_SIGNAL=15
          AFL_RENODE_COVERAGE=$coverage AFL_RENODE_CRASH_INFO=$dir/crash-info
-         "$afl_root/afl-fuzz" -V "$left" -t 15000 -i "$input" -o "$dir/afl" "${role[@]}"
+         AFL_RENODE_HEARTBEAT=$dir/$name.alive
+         "$afl_root/afl-fuzz" -V "$left" -t 20000 -i "$input" -o "$dir/afl" "${role[@]}"
          -R -- "$resc" "$dir/zephyr.elf")
     if [ -n "$dry" ]; then
         echo "(cd $afl_root && setsid ${cmd[*]} >> $dir/$name.log 2>&1 &)"
@@ -76,6 +89,26 @@ start_instance() {        # OUT GROUP NAME resume
     echo "=== $(date '+%F %T') start ($([ "$resume" = 1 ] && echo resume || echo new), ${left}s)" >>"$dir/$name.log"
     (cd "$afl_root" && exec setsid "${cmd[@]}") </dev/null >>"$dir/$name.log" 2>&1 &
     echo $! >"$dir/$name.pid"
+}
+
+# pid of the campaign's supervisor (watchdog.py --supervise), if running
+supervisor_pid() {
+    local f=$1/supervisor.pid pid
+    [ -f "$f" ] || return 1
+    pid=$(cat "$f")
+    [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' <"/proc/$pid/cmdline" | grep -q -- --supervise &&
+        echo "$pid"
+}
+
+start_supervisor() {      # OUT
+    local pid
+    if pid=$(supervisor_pid "$1"); then
+        echo "supervisor already running ($pid)"
+        return 0
+    fi
+    setsid "$here/watchdog.py" --supervise "$1" </dev/null >>"$1/supervisor.log" 2>&1 &
+    echo $! >"$1/supervisor.pid"
+    echo "supervisor started ($!)"
 }
 
 status() {                # OUT
@@ -110,7 +143,7 @@ coverage=window
 dry=""
 wait=""
 mode=start
-while getopts "d:j:o:c:nwR:S:K:h" opt; do
+while getopts "d:j:o:c:nwR:S:K:P:h" opt; do
     case $opt in
     d) secs=$OPTARG ;;
     j) jobs=$OPTARG ;;
@@ -121,6 +154,7 @@ while getopts "d:j:o:c:nwR:S:K:h" opt; do
     R) mode=restart; out=$OPTARG ;;
     S) mode=status; out=$OPTARG ;;
     K) mode=stop; out=$OPTARG ;;
+    P) mode=supervise; out=$OPTARG ;;
     *) usage ;;
     esac
 done
@@ -133,8 +167,14 @@ fi
 case $mode in
 status)
     status "$out"
+    pid=$(supervisor_pid "$out") && echo "supervisor running ($pid)" || echo "supervisor not running"
+    exit 0 ;;
+supervise)
+    start_supervisor "$out"
     exit 0 ;;
 stop)
+    # first, or it would restart the instances
+    pid=$(supervisor_pid "$out") && kill "$pid" && echo "stopped supervisor ($pid)"
     while read -r group name; do
         pid=$(instance_pid "$out/$group" "$name") && kill "$pid" && echo "stopped $group/$name ($pid)"
     done <"$out/instances"
@@ -203,6 +243,7 @@ if [ -n "$dry" ]; then
     exit 0
 fi
 echo "campaign in $out: $(wc -l <"$out/instances") instances for ${secs}s"
+start_supervisor "$out"
 [ -n "$wait" ] || exit 0
 while running "$out"; do sleep 10; done
 status "$out"

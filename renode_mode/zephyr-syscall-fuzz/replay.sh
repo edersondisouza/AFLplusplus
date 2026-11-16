@@ -47,6 +47,8 @@ echo "include @$root/renode_mode/example-syscall.resc" >"$resc"
 if [ -n "$gdb_port" ]; then
     echo "machine StartGdbServer $gdb_port true" >>"$resc"
     export AFL_RENODE_HOLD=1
+    # breakpoints stop the clock only for the guest
+    export AFL_RENODE_MAX_WALL=0
     echo "Attach with: arm-zephyr-eabi-gdb $elf -ex 'target remote :$gdb_port'" >&2
 fi
 

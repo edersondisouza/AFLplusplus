@@ -26,6 +26,7 @@ window/kernel mode to <file>, to compare corpora independently of map hashing.
 '''
 
 import os
+import time
 from bisect import bisect_right
 import ctypes
 import hashlib
@@ -44,6 +45,14 @@ STATUS_HANG = W_EXITCODE(0, LINUX_SIGALRM)
 
 # Host-side watchdog, in quanta, in case the guest never reaches a marker.
 MAX_QUANTA = int(os.environ.get("AFL_RENODE_MAX_QUANTA", "3000"))
+# The same in wall-clock seconds: under host load a run can take far longer
+# than its quanta suggest. Keep it below afl-fuzz -t, so the harness always
+# reports first (see campaign.sh). 0 disables it (replay.sh does, for GDB).
+MAX_WALL = float(os.environ.get("AFL_RENODE_MAX_WALL", "10"))
+# File touched at least every HEARTBEAT_SECS while runs complete, so a
+# supervisor can tell a live Renode from a wedged one (see watchdog.py).
+HEARTBEAT = os.environ.get("AFL_RENODE_HEARTBEAT")
+HEARTBEAT_SECS = 10
 CRASH_INFO_DIR = os.environ.get("AFL_RENODE_CRASH_INFO")
 HOLD = os.environ.get("AFL_RENODE_HOLD") == "1"
 NO_START = os.environ.get("AFL_RENODE_NO_START") == "1"
@@ -101,6 +110,9 @@ input_addr = None
 started = False
 held = False
 quanta = 0
+run_start = 0.0
+hang_cause = None
+last_beat = 0.0
 last_input = b""
 _orig_do_one_child = afl_renode.do_one_child
 _orig_one_fuzz_complete = afl_renode.one_fuzz_complete
@@ -265,10 +277,22 @@ def restore_image():
         cpu.PC = pc
 
 
+def heartbeat():
+    global last_beat
+    now = time.time()
+    if not HEARTBEAT or now - last_beat < HEARTBEAT_SECS:
+        return
+    last_beat = now
+    with open(HEARTBEAT, "a"):
+        os.utime(HEARTBEAT, None)
+
+
 def do_one_child():
-    global started, quanta
+    global started, quanta, run_start, hang_cause
     _orig_do_one_child()
     quanta = 0
+    hang_cause = None
+    heartbeat()
     if not started:
         snapshot_image()
     else:
@@ -284,6 +308,7 @@ def do_one_child():
         in_window = False
         set_block_hook(gate_block)
     afl_renode.reset = False
+    run_start = time.time()
 
     if not started:
         started = True
@@ -292,9 +317,15 @@ def do_one_child():
 
 
 def quantum_hook(mach):
-    global quanta
+    global quanta, hang_cause
     quanta += 1
-    if quanta > MAX_QUANTA and afl_renode.status is None:
+    if afl_renode.status is not None:
+        return
+    if quanta > MAX_QUANTA:
+        hang_cause = "%d quanta" % MAX_QUANTA
+    elif MAX_WALL > 0 and time.time() - run_start > MAX_WALL:
+        hang_cause = "%g s wall clock, %d quanta" % (MAX_WALL, quanta)
+    if hang_cause:
         afl_renode.status = STATUS_HANG
 
 
@@ -338,6 +369,8 @@ def describe_failure(status):
                                            .get(status, "other")),
              "input: %d bytes, sha1 %s" % (len(last_input),
                                            hashlib.sha1(last_input).hexdigest())]
+    if status == STATUS_HANG and hang_cause:
+        lines.append("hang: %s" % hang_cause)
     ensure_symbols()
     addrs = crash_addrs or afl_renode.symbol_addresses("afl_crash")
     if not addrs:

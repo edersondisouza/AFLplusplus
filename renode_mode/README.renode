@@ -107,11 +107,14 @@ LOAD segments are written back after each reset, see "Renode memory"
 below), and a run ends when the guest
 calls afl_done (success), afl_bug (kernel fault/panic/assert, reported
 as SIGABRT) or afl_hang, or when the host watchdog expires after
-AFL_RENODE_MAX_QUANTA quanta.  User thread oopses are expected and are
+AFL_RENODE_MAX_QUANTA quanta or AFL_RENODE_MAX_WALL seconds of wall
+clock (default 10, keep it below afl-fuzz -t; see "Instance deaths"
+below; 0 disables it).  User thread oopses are expected and are
 not crashes.  An optional second argument to afl-renode-trace selects
 the ELF:
 
-  afl-fuzz -t 15000 -i renode_mode/zephyr-syscall-fuzz/seeds/poll -o out \
+  AFL_KILL_SIGNAL=18 AFL_FORK_SERVER_KILL_SIGNAL=15 \
+  afl-fuzz -t 20000 -i renode_mode/zephyr-syscall-fuzz/seeds/poll -o out \
       -R -- renode_mode/example-syscall.resc zephyr-syscall-fuzz.elf
 
 Building with CONFIG_SYSCALL_FUZZ_SELFTEST=y plants kernel bugs (input
@@ -210,22 +213,35 @@ Other modes act on a running campaign:
   campaign.sh -S OUT               status of every instance
   campaign.sh -R OUT GROUP/NAME..  restart dead instances, resuming their
                                    queue (-i -) for the time left
-  campaign.sh -K OUT               stop all instances
+  campaign.sh -K OUT               stop the supervisor, then all instances
+  campaign.sh -P OUT               (re)start the supervisor
+
+A supervisor (watchdog.py --supervise) is started detached with the
+campaign and runs until its deadline, so the campaign survives without
+anyone watching: it restarts instances whose afl-fuzz died (with -R, at
+most --max-restarts per instance per hour), and SIGKILLs a Renode whose
+heartbeat file (OUT/<group>/<name>.alive, touched by the harness at
+least every 10 s while runs complete) is older than --stall seconds, so
+that instance is then restarted too.  Its actions go to
+OUT/actions.log (and OUT/supervisor.log, with log tails).
 
 watchdog.py OUT monitors a campaign: every --interval seconds it samples
 the instances (fuzzer_stats, Renode RSS, disk space) into
 OUT/metrics.csv, and it exits when something needs attention: 0 when the
 campaign is over, 3 on events (an instance died, Renode RSS above
 --rss-mb or grown by --rss-growth-mb, exec/s below --min-eps, stats
-stalled, new crashes/hangs, low disk), 4 for a periodic report
-(--report-hours).  New crashes are grouped by signature (assertion, or
+stalled, new crashes/hangs, low disk, a supervisor action, or no
+supervisor running), 4 for a periodic report
+(--report-hours).  While the supervisor runs, dead and stalled
+instances are reported through its actions instead.  New crashes are grouped by signature (assertion, or
 fault reason and PC from crash-info/) with an example input.  Each event
 is reported once (OUT/watchdog.ack), so it can simply be run again after
 handling it; touch OUT/<group>/<name>.retired to stop watching an
 instance.  The intended loop, e.g. from an agent session: start the
 campaign detached, run watchdog.py in the foreground, on exit triage
 (replay.sh on the group's copied ELF), restart with -R if needed, and
-run watchdog.py again.
+run watchdog.py again.  The supervisor keeps the campaign alive if that
+loop is interrupted.
 
 Disk usage: the output defaults to $HOME/zfuzz/<date> (or
 $ZFUZZ_CAMPAIGNS/<date>), and campaign.sh warns if OUT is under /tmp.
@@ -296,6 +312,23 @@ Challenges and how they were handled
   so the harness keeps the addresses it needs and reloads the symbols
   (LoadSymbolsFrom) only when decoding a failure.  watchdog.py still
   watches RSS in case of other leaks.
+
+* Instance deaths.  In the first weekend campaign (12 instances, left
+  unmonitored by mistake) 9 instances died within 1-22 h, all with
+  "Unable to communicate with fork server".  Renode is both the fork
+  server and the target and reports its own pid as the child, so when a
+  run exceeds afl-fuzz -t, afl-fuzz SIGKILLs Renode itself and aborts
+  (reproduced with -t 3000 on hang inputs).  The harness's hang limit
+  was in quanta (simulated time), whose wall-clock cost grows with host
+  load, so under a loaded host some runs passed 15 s.  Three fixes:
+  campaign.sh sets AFL_KILL_SIGNAL=18 (SIGCONT, a no-op) so a timeout no
+  longer kills Renode (AFL_FORK_SERVER_KILL_SIGNAL=15 keeps shutdown
+  working); the harness also ends a run after AFL_RENODE_MAX_WALL
+  seconds (10, below -t 20000), so it always reports first; and the
+  supervisor restarts dead instances and kills a Renode that is truly
+  wedged (with SIGCONT, afl-fuzz would otherwise wait for it forever).
+  Wall-clock hangs are marked "hang: ... wall clock" in crash-info, as
+  they may not replay on an idle host.
 
 * Coverage is verified, not assumed: replay_corpus.py -e dumps the
   edges of the seeds; each seed was checked to reach the kernel
