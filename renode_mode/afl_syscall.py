@@ -233,7 +233,44 @@ def flush_edge_log():
 
 image = []
 image_pcs = []
-crash_addrs = set()
+
+
+def elf_symbols(path):
+    '''Sorted (address, size, name) of the FUNC/OBJECT symbols of a 32-bit
+    little-endian ELF, Thumb bit cleared.'''
+    with open(path, "rb") as f:
+        data = f.read()
+    shoff, = struct.unpack_from("<I", data, 32)
+    shentsize, shnum = struct.unpack_from("<HH", data, 46)
+    shdrs = [struct.unpack_from("<10I", data, shoff + i * shentsize) for i in range(shnum)]
+    syms = []
+    for sh in shdrs:
+        if sh[1] != 2:          # SHT_SYMTAB
+            continue
+        stroff = shdrs[sh[6]][4]  # sh_link: its string table
+        for off in range(sh[4], sh[4] + sh[5], 16):
+            st_name, value, size, info, _, shndx = struct.unpack_from("<IIIBBH", data, off)
+            # OBJECT/FUNC, not undefined or absolute (Kconfig values, offsets)
+            if info & 0xf not in (1, 2) or not value or shndx in (0, 0xfff1):
+                continue
+            end = data.index(b"\0", stroff + st_name)
+            name = data[stroff + st_name:end].decode("ascii", "replace")
+            syms.append((value & ~1 if info & 0xf == 2 else value, size, name))
+    syms.sort()
+    return syms
+
+
+_symbols = None
+
+
+def symbols():
+    '''The ELF's symbols, read once. Renode's own lookup cannot be used:
+    Machine.Reset() drops the symbols and reloading them (LoadSymbolsFrom)
+    leaks ~140 KB of Renode memory per call, i.e. per failure.'''
+    global _symbols
+    if _symbols is None:
+        _symbols = elf_symbols(os.environ["AFL_RENODE_ELF"])
+    return _symbols
 
 
 def elf_load_ranges(path):
@@ -263,7 +300,6 @@ def snapshot_image():
     if not elf:
         raise ValueError("AFL_RENODE_ELF not set: pass the ELF to afl-renode-trace")
     bus, _ = bus_and_cpu()
-    crash_addrs.update(afl_renode.symbol_addresses("afl_crash"))
     for addr, size in elf_load_ranges(elf):
         image.append((addr, bus.ReadBytes(System.UInt64(addr), size)))
     image_pcs.extend(cpu.PC for cpu in bus.GetCPUs())
@@ -334,28 +370,17 @@ def bus_and_cpu():
     return bus, list(bus.GetCPUs())[0]
 
 
-def ensure_symbols():
-    '''Machine.Reset() drops the symbols LoadELF added; reload them for decoding.
-
-    Only on failures: like LoadELF, this would leak if done for every run.'''
-    bus, cpu = bus_and_cpu()
-    try:
-        bus.GetAllSymbolAddresses("user_entry", cpu)
-    except Exception:
-        monitor.Parse("sysbus LoadSymbolsFrom @%s" % os.environ["AFL_RENODE_ELF"])
-
-
 def symbolize(addr):
-    bus, cpu = bus_and_cpu()
-    try:
-        name = bus.FindSymbolAt(System.UInt64(addr & ~1), cpu)
-    except Exception:
-        name = None
-    if not name:
-        return hex(addr)
-    name = name.replace(" (entry)", "")
-    base = min(afl_renode.symbol_addresses(name) or [addr & ~1])
-    return "%s (%s+%#x)" % (hex(addr), name, (addr & ~1) - base)
+    syms = symbols()
+    a = addr & ~1
+    i = bisect_right(syms, (a, 0xFFFFFFFF, "")) - 1
+    # the closest preceding symbols that contain a (sizes may overlap)
+    while i >= 0 and syms[i][0] > a - 0x10000:
+        start, size, name = syms[i]
+        if a < start + max(size, 1):
+            return "%s (%s+%#x)" % (hex(addr), name, a - start)
+        i -= 1
+    return hex(addr)
 
 
 def read_string(addr, limit=256):
@@ -371,8 +396,7 @@ def describe_failure(status):
                                            hashlib.sha1(last_input).hexdigest())]
     if status == STATUS_HANG and hang_cause:
         lines.append("hang: %s" % hang_cause)
-    ensure_symbols()
-    addrs = crash_addrs or afl_renode.symbol_addresses("afl_crash")
+    addrs = [a for a, _, n in symbols() if n == "afl_crash"]
     if not addrs:
         return lines + ["no afl_crash symbol in this ELF"]
     bus, _ = bus_and_cpu()

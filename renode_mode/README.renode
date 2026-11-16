@@ -309,9 +309,15 @@ Challenges and how they were handled
   zeroed .bss) and the entry PC before the first run and writes them
   back after each reset.  Renode now stays at ~350-450 MB and exec/s
   went up ~20%.  Machine.Reset() also drops the symbols LoadELF added,
-  so the harness keeps the addresses it needs and reloads the symbols
-  (LoadSymbolsFrom) only when decoding a failure.  watchdog.py still
-  watches RSS in case of other leaks.
+  and reloading them (LoadSymbolsFrom) leaks too, ~140 KB per call: the
+  first weekend campaign did it on every failure, and the thread group
+  (~4700 hangs per instance) grew to 2.2 GB in 62 h, a third of it
+  explained by this.  The harness now keeps the addresses it needs from
+  before the first reset and symbolizes crash records from the ELF's
+  own symbol table (afl_syscall.elf_symbols), never asking Renode; 2000
+  resets plus describe_failure() now grow RSS no more than resets alone
+  (~50 MB, levelling off).  The rest of the growth (~20 MB/h) is not
+  explained yet; watchdog.py watches RSS (--rss-growth-mb).
 
 * Instance deaths.  In the first weekend campaign (12 instances, left
   unmonitored by mistake) 9 instances died within 1-22 h, all with
