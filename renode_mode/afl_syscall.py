@@ -23,6 +23,11 @@ Coverage (AFL_RENODE_COVERAGE):
           sequences are new, a useful stepping stone.
 AFL_RENODE_EDGE_LOG=<file> appends every new exact (from, to) edge seen in
 window/kernel mode to <file>, to compare corpora independently of map hashing.
+AFL_RENODE_TRACE=<file> writes, after each run, the ops the workers executed
+(input offset, worker, op name, argument bytes) and the outcome to <file>,
+for triage (replay.sh -t). It needs window/kernel coverage: ops are seen by
+the block hook already installed for coverage, so tracing does not change
+the guest's timing.
 '''
 
 import os
@@ -30,6 +35,7 @@ import time
 from bisect import bisect_right
 import ctypes
 import hashlib
+import re
 import struct
 
 import System
@@ -62,6 +68,10 @@ if COVERAGE not in ("all", "window", "kernel"):
 COV_RANGES = os.environ.get("AFL_RENODE_COV_RANGES") or (
     os.environ.get("AFL_RENODE_ELF", "") + ".cov")
 EDGE_LOG = os.environ.get("AFL_RENODE_EDGE_LOG")
+TRACE = os.environ.get("AFL_RENODE_TRACE")
+TRACE_KEEP = 1000       # ops kept from each end of a long trace
+SRC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "zephyr-syscall-fuzz", "src")
 MAP_MASK = afl_renode.MAP_SIZE - 1
 
 AFL_CRASH_MAGIC = 0xAF1FC4A5
@@ -163,6 +173,8 @@ def gate_block(pc, size):
             afl_renode.status = afl_renode.endgame[pc]
         in_window = False
         return
+    if pc == trace_pc:
+        trace_op()
     if not in_window:
         if pc in window_starts and afl_renode.status is None:
             in_window = True
@@ -235,27 +247,34 @@ image = []
 image_pcs = []
 
 
-def elf_symbols(path):
-    '''Sorted (address, size, name) of the FUNC/OBJECT symbols of a 32-bit
-    little-endian ELF, Thumb bit cleared.'''
+def elf_symtab(path):
+    '''(value, size, type, section index, name) of every symbol of a 32-bit
+    little-endian ELF'''
     with open(path, "rb") as f:
         data = f.read()
     shoff, = struct.unpack_from("<I", data, 32)
     shentsize, shnum = struct.unpack_from("<HH", data, 46)
     shdrs = [struct.unpack_from("<10I", data, shoff + i * shentsize) for i in range(shnum)]
-    syms = []
     for sh in shdrs:
         if sh[1] != 2:          # SHT_SYMTAB
             continue
         stroff = shdrs[sh[6]][4]  # sh_link: its string table
         for off in range(sh[4], sh[4] + sh[5], 16):
             st_name, value, size, info, _, shndx = struct.unpack_from("<IIIBBH", data, off)
-            # OBJECT/FUNC, not undefined or absolute (Kconfig values, offsets)
-            if info & 0xf not in (1, 2) or not value or shndx in (0, 0xfff1):
-                continue
             end = data.index(b"\0", stroff + st_name)
-            name = data[stroff + st_name:end].decode("ascii", "replace")
-            syms.append((value & ~1 if info & 0xf == 2 else value, size, name))
+            yield (value, size, info & 0xf, shndx,
+                   data[stroff + st_name:end].decode("ascii", "replace"))
+
+
+def elf_symbols(path):
+    '''Sorted (address, size, name) of the FUNC/OBJECT symbols of a 32-bit
+    little-endian ELF, Thumb bit cleared.'''
+    syms = []
+    for value, size, typ, shndx, name in elf_symtab(path):
+        # OBJECT/FUNC, not undefined or absolute (Kconfig values, offsets)
+        if typ not in (1, 2) or not value or shndx in (0, 0xfff1):
+            continue
+        syms.append((value & ~1 if typ == 2 else value, size, name))
     syms.sort()
     return syms
 
@@ -342,6 +361,9 @@ def do_one_child():
         setup_window()
         global in_window
         in_window = False
+        if TRACE and trace_pc is None:
+            setup_trace()
+        del trace[:]
         set_block_hook(gate_block)
     afl_renode.reset = False
     run_start = time.time()
@@ -363,6 +385,88 @@ def quantum_hook(mach):
         hang_cause = "%g s wall clock, %d quanta" % (MAX_WALL, quanta)
     if hang_cause:
         afl_renode.status = STATUS_HANG
+
+
+trace_pc = None
+trace = []
+trace_info = {}
+
+
+def setup_trace():
+    '''Finds group_op, the group (from its Kconfig symbol) and its op names
+    (the enum in src/group_<name>.c).'''
+    global trace_pc
+    elf = os.environ["AFL_RENODE_ELF"]
+    conf = dict((n, v) for v, _, _, shndx, n in elf_symtab(elf)
+                if shndx == 0xfff1 and n.startswith("CONFIG_"))
+    groups = [n[len("CONFIG_SYSCALL_FUZZ_GROUP_"):].lower() for n in conf
+              if n.startswith("CONFIG_SYSCALL_FUZZ_GROUP_")]
+    if len(groups) != 1:
+        raise ValueError("AFL_RENODE_TRACE: cannot tell the group of %s" % elf)
+    names = []
+    with open(os.path.join(SRC_DIR, "group_%s.c" % groups[0])) as f:
+        src = f.read()
+    m = re.search(r"enum (?:fz_)?op \{([^}]*)\}", src)
+    if m:
+        names = [n.strip()[3:] for n in m.group(1).split(",") if n.strip()]
+    names = names[:names.index("COUNT")] if "COUNT" in names else names
+    syms = dict((n, (a, size)) for a, size, n in symbols())
+    workers, size = syms["workers"]
+    nworkers = conf.get("CONFIG_SYSCALL_FUZZ_WORKERS", 2)
+    trace_info.update(group=groups[0], names=names, workers=workers,
+                      thread_size=size // nworkers, nworkers=nworkers,
+                      fz_mem=syms["fz_mem"][0], kernel=syms["_kernel"][0])
+    trace_pc = syms["group_op"][0]
+
+
+def trace_op():
+    '''At group_op entry: main.c has just stored the op's offset and byte'''
+    bus = monitor.Machine[sysbus_name]
+    fz = trace_info["fz_mem"]
+    offset = bus.ReadDoubleWord(System.UInt64(fz + 8))       # fz_mem.op_offset
+    op = bus.ReadByte(System.UInt64(fz + 12))                # fz_mem.cur_op
+    cur = bus.ReadDoubleWord(System.UInt64(trace_info["kernel"] + 8))  # _kernel.cpus[0].current
+    trace.append((int(offset), int(op), int(cur), quanta))
+
+
+def thread_name(addr):
+    i, rem = divmod(addr - trace_info["workers"], trace_info["thread_size"])
+    if rem == 0 and 0 <= i < trace_info["nworkers"]:
+        return "w%d" % i
+    return symbolize(addr)
+
+
+def write_trace(status):
+    names = trace_info["names"]
+    lines = ["# group %s, %d bytes, sha1 %s" % (trace_info["group"], len(last_input),
+                                               hashlib.sha1(last_input).hexdigest()),
+             "# arguments are the bytes up to the next op, in execution order",
+             "# offset  quantum  worker  op",
+             ]
+    rewinds = sum(1 for a, b in zip(trace, trace[1:]) if b[0] <= a[0])
+    if rewinds:
+        lines.append("# stream rewound %d times: a syscall overwrote the workers' "
+                     "input position (harness artefact)" % rewinds)
+    for i, (offset, op, cur, q) in enumerate(trace):
+        if TRACE_KEEP <= i < len(trace) - TRACE_KEEP:
+            if i == TRACE_KEEP:
+                lines.append("# ... %d ops left out ..." % (len(trace) - 2 * TRACE_KEEP))
+            continue
+        end = trace[i + 1][0] if i + 1 < len(trace) else len(last_input)
+        if end <= offset:
+            end = len(last_input)
+        name = names[op % len(names)] if names else "?"
+        args = " ".join("%02x" % b for b in bytearray(last_input[offset + 1:end]))
+        lines.append("%8d %8d  %-6s  %#04x %-16s %s" % (offset, q, thread_name(cur),
+                                                          op, name, args))
+    lines.append("# outcome:")
+    if status == STATUS_SUCCESS:
+        lines.append("status: 0 (done)")
+    else:
+        lines.extend(describe_failure(status))
+    with open(TRACE, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    del trace[:]
 
 
 def bus_and_cpu():
@@ -426,6 +530,8 @@ def one_fuzz_complete(status):
     if held:
         return
     flush_edge_log()
+    if TRACE and trace_pc is not None:
+        write_trace(status)
     if status != STATUS_SUCCESS:
         text = "\n".join(describe_failure(status)) + "\n"
         if afl_renode.shmid == -1:

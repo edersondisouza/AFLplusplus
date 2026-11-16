@@ -1,27 +1,30 @@
 #!/usr/bin/env bash
 # Replay one test case on a zephyr-syscall-fuzz ELF and print its crash record.
 #
-#   replay.sh [-g PORT [-w]] [-u UART_FILE] ELF INPUT
+#   replay.sh [-g PORT [-w]] [-u UART_FILE] [-t TRACE_FILE] ELF INPUT
 #
 #   -g PORT  start a GDB server on PORT; after a failure the machine is kept
 #            alive (spinning in k_sys_fatal_error_handler) until Ctrl-C
 #   -w       with -g, do not start the CPU until the debugger continues
 #   -u FILE  save the guest UART output to FILE
+#   -t FILE  save the ops the workers executed (offset, worker, op, arguments)
+#            and the outcome to FILE
 
 set -e
 
 usage() {
-    sed -n '2,10s/^# \{0,1\}//p' "$0" >&2
+    sed -n '2,12s/^# \{0,1\}//p' "$0" >&2
     exit 1
 }
 
 gdb_port=""
 uart=""
-while getopts "g:wu:h" opt; do
+while getopts "g:wu:t:h" opt; do
     case $opt in
     g) gdb_port=$OPTARG ;;
     w) export AFL_RENODE_NO_START=1 ;;
     u) uart=$(readlink -f "$OPTARG") ;;
+    t) export AFL_RENODE_TRACE=$(readlink -f "$OPTARG") ;;
     *) usage ;;
     esac
 done

@@ -132,8 +132,20 @@ crashes/ can be matched with `sha1sum`. To look at a single input:
 
 prints the same summary, and with `-g 3333` keeps the crashed machine
 alive behind a GDB server (`-w` waits for the debugger before booting).
+`-t trace.txt` (AFL_RENODE_TRACE) also writes the ops the workers
+executed, in order: input offset, quantum, worker, op name and argument
+bytes, then the crash record.  The ops are seen by the coverage block
+hook, so tracing does not change the run.
 Replay on the same ELF that found the crash: inputs may contain raw
 addresses that are only meaningful for that build.
+
+To hand the findings of a campaign to someone else,
+zephyr-syscall-fuzz/export_findings.py OUT BUNDLE copies, per group, the
+ELF, its .config, every distinct crash/hang input and its crash record,
+replays every input with a trace, groups them by signature (reason and
+pc/lr functions, or the op a hang was stuck in, split by whether the
+stream rewound) and writes index.md/index.csv with a trace per
+signature.  The bundle README is written by hand.
 
 Coverage is selected with AFL_RENODE_COVERAGE:
 
@@ -336,6 +348,22 @@ Challenges and how they were handled
   Wall-clock hangs are marked "hang: ... wall clock" in crash-info, as
   they may not replay on an idle host.
 
+* Hangs that are not hangs.  All hang representatives of the first
+  weekend campaign (tracing every input, see export_findings.py) were
+  harness artefacts, of two kinds, still to be fixed:
+  - the stream rewinds: a syscall given a raw pointer to fz_mem (e.g.
+    k_thread_name_copy(.., 0x10000, 127) in the thread group) resets
+    upos, and the input replays from the start until HANG_MS.  The
+    supervisor only notices upos going backwards between two of its
+    samples, and the workers get back past the old position within a
+    tick.  This also made the thread group slow (~2 s per such input).
+  - the run budget: HANG_MS is a budget for the whole run, so long
+    chains of 1-3 tick sleeps (or waits with short timeouts) exceed it
+    while the kernel makes progress all along.
+  Possible fixes: keep raw pointers off the fz_mem header (or keep the
+  stream position where users cannot write it) and count a hang only
+  when the input position stops advancing for HANG_MS.
+
 * Coverage is verified, not assumed: replay_corpus.py -e dumps the
   edges of the seeds; each seed was checked to reach the kernel
   function it targets.
@@ -386,6 +414,20 @@ them with replay.sh on a build with CONFIG_SYSCALL_FUZZ_SKIP_KNOWN_BUGS=n):
   in z_thread_entry); with an MPU without that constraint it would give
   user mode write access to the privileged stack.
   (thread-create-dyn-stack-oversize)
+
+* A dynamic user stack can be freed while a thread still runs on it:
+  a worker allocates a stack (k_thread_stack_alloc) and creates a thread
+  on it, then drops its last reference to the stack (k_object_release)
+  while the thread is alive.  unref_check() frees the stack object,
+  the heap chunk is reused, and the running thread or the heap later
+  fails: heap corruption panics in sys_heap_free()/free_list_*(),
+  permission faults in unref_check(), or an undefined instruction in
+  arch_user_mode_enter() (k_free() of the stack from
+  exit_thread_userspace).  The kernel object system does not count a
+  thread using a stack as a reference.  Found by the first weekend
+  campaign, which skipped the bugs above; most of the objects group's
+  crashes are variants of it.  Not avoided by SKIP_KNOWN_BUGS yet.
+  (dyn-stack-freed-while-thread-runs)
 
 CONFIG_SYSCALL_FUZZ_SKIP_KNOWN_BUGS (default y) avoids them so long
 campaigns are not filled with variants: too small stacks and msg_size 0
