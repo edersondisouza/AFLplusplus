@@ -95,8 +95,8 @@ static k_tid_t main_tid;
  * whole run's budget (then the run just ends: long chains of short sleeps
  * are not hangs) and how long all workers may stay blocked.
  */
-#define HANG_MS    500
-#define RUN_MS     1000
+#define HANG_MS    200
+#define RUN_MS     300
 #define IDLE_TICKS 4
 
 K_APPMEM_PARTITION_DEFINE(fz_part);
@@ -116,15 +116,33 @@ static uint32_t klen;	/* kernel copy of fz_mem.ulen */
 
 static struct k_mem_domain fz_domain;
 
+/*
+ * Takes the next input byte's position. Atomic: a worker preempted between
+ * reading and writing upos would otherwise write back an old position after
+ * the other worker consumed bytes, i.e. rewind the stream (and the
+ * supervisor then ends the run).
+ */
+BUILD_ASSERT(sizeof(atomic_t) == sizeof(fz_mem.upos));
+
+static bool take(uint32_t *pos)
+{
+	atomic_val_t p;
+
+	do {
+		p = atomic_get((atomic_t *)&fz_mem.upos);
+		if ((uint32_t)p >= fz_mem.ulen || (uint32_t)p >= AFL_INPUT_MAX) {
+			return false;
+		}
+	} while (!atomic_cas((atomic_t *)&fz_mem.upos, p, p + 1));
+	*pos = (uint32_t)p;
+	return true;
+}
+
 uint8_t next_u8(void)
 {
-	uint32_t pos = fz_mem.upos;
+	uint32_t pos;
 
-	if (pos >= fz_mem.ulen || pos >= AFL_INPUT_MAX) {
-		return 0;
-	}
-	fz_mem.upos = pos + 1;
-	return fz_mem.ubuf[pos];
+	return take(&pos) ? fz_mem.ubuf[pos] : 0;
 }
 
 uint32_t next_u32(void)
@@ -263,10 +281,12 @@ static void user_entry(void *p1, void *p2, void *p3)
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	while (fz_mem.upos < fz_mem.ulen && fz_mem.upos < AFL_INPUT_MAX) {
-		fz_mem.op_offset = fz_mem.upos;
-		uint8_t op = next_u8();
+	uint32_t pos;
 
+	while (take(&pos)) {
+		uint8_t op = fz_mem.ubuf[pos];
+
+		fz_mem.op_offset = pos;
 		fz_mem.cur_op = op;
 
 		if (IS_ENABLED(CONFIG_SYSCALL_FUZZ_SELFTEST) &&

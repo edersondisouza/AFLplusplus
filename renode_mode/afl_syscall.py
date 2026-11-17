@@ -363,8 +363,8 @@ def do_one_child():
         in_window = False
         if group_op_pc is None:
             setup_op_hook()
-        global last_op_offset
-        last_op_offset = -1
+        global last_upos
+        last_upos = 0
         del trace[:]
         set_block_hook(gate_block)
     afl_renode.reset = False
@@ -390,7 +390,7 @@ def quantum_hook(mach):
 
 
 group_op_pc = None
-last_op_offset = -1
+last_upos = 0
 rewinds = 0
 trace = []
 trace_info = {}
@@ -410,24 +410,27 @@ def setup_op_hook():
 def op_entry():
     '''At group_op entry: main.c has just stored the op's offset and byte.
 
-    The input offset of successive ops only grows. If it goes back, a
-    syscall overwrote the stream position (the guest keeps raw pointers off
-    it, so this is a harness bug): the input would replay in a loop until
-    the run budget, so end the run here like the guest's own tamper check,
-    and log the input.'''
-    global last_op_offset, rewinds
+    The stream position (fz_mem.upos) only grows. If it goes back, a
+    syscall overwrote it (the guest keeps raw pointers off it, so this is a
+    harness bug): the input would replay in a loop until the run budget, so
+    end the run here like the guest's own tamper check, and log the input.
+    Op offsets themselves need not grow: a worker preempted between reading
+    its op byte and calling group_op() enters it after the other worker's
+    later ops.'''
+    global last_upos, rewinds
     bus = monitor.Machine[sysbus_name]
-    offset = int(bus.ReadDoubleWord(System.UInt64(trace_info["fz_mem"] + 8)))
-    if offset <= last_op_offset:
+    upos = int(bus.ReadDoubleWord(System.UInt64(trace_info["fz_mem"])))
+    if upos < last_upos:
         rewinds += 1
         if not TRACE and afl_renode.status is None:
             afl_renode.status = STATUS_SUCCESS
             if CRASH_INFO_DIR:
                 with open(os.path.join(CRASH_INFO_DIR, "rewinds.log"), "a") as f:
                     f.write("%s\n" % hashlib.sha1(last_input).hexdigest())
-    last_op_offset = offset
+    last_upos = upos
     if TRACE:
-        trace_op(offset)
+        offset = int(bus.ReadDoubleWord(System.UInt64(trace_info["fz_mem"] + 8)))
+        trace_op(offset, upos)
 
 
 def setup_trace():
@@ -454,11 +457,11 @@ def setup_trace():
                       thread_size=size // nworkers, nworkers=nworkers)
 
 
-def trace_op(offset):
+def trace_op(offset, upos):
     bus = monitor.Machine[sysbus_name]
     op = bus.ReadByte(System.UInt64(trace_info["fz_mem"] + 12))  # fz_mem.cur_op
     cur = bus.ReadDoubleWord(System.UInt64(trace_info["kernel"] + 8))  # _kernel.cpus[0].current
-    trace.append((offset, int(op), int(cur), quanta))
+    trace.append((offset, int(op), int(cur), quanta, upos))
 
 
 def thread_name(addr):
@@ -475,18 +478,20 @@ def write_trace(status):
              "# arguments are the bytes up to the next op, in execution order",
              "# offset  quantum  worker  op",
              ]
-    n = sum(1 for a, b in zip(trace, trace[1:]) if b[0] <= a[0])
+    n = sum(1 for a, b in zip(trace, trace[1:]) if b[4] < a[4])
     if n:
         lines.append("# stream rewound %d times: a syscall overwrote the workers' "
                      "input position (harness artefact)" % n)
-    for i, (offset, op, cur, q) in enumerate(trace):
+    # an op's arguments run up to the next op in the input (ops of
+    # different workers can be traced out of input order)
+    offsets = sorted(set(t[0] for t in trace))
+    for i, (offset, op, cur, q, _) in enumerate(trace):
         if TRACE_KEEP <= i < len(trace) - TRACE_KEEP:
             if i == TRACE_KEEP:
                 lines.append("# ... %d ops left out ..." % (len(trace) - 2 * TRACE_KEEP))
             continue
-        end = trace[i + 1][0] if i + 1 < len(trace) else len(last_input)
-        if end <= offset:
-            end = len(last_input)
+        j = bisect_right(offsets, offset)
+        end = offsets[j] if j < len(offsets) else len(last_input)
         name = names[op % len(names)] if names else "?"
         args = " ".join("%02x" % b for b in bytearray(last_input[offset + 1:end]))
         lines.append("%8d %8d  %-6s  %#04x %-16s %s" % (offset, q, thread_name(cur),

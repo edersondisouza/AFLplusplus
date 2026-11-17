@@ -275,8 +275,8 @@ Challenges and how they were handled
   event/join waits block forever.  Two user workers share the input,
   the supervisor (higher priority, kernel mode) ends the run when all
   workers are blocked or dead and the system is idle for IDLE_TICKS, or
-  after RUN_MS (1 s) of uptime.  A hang is a worker that stays runnable
-  for HANG_MS (500 ms) without the input advancing, so hangs are only
+  after RUN_MS (300 ms) of uptime.  A hang is a worker that stays
+  runnable for HANG_MS (200 ms) without the input advancing, so hangs are only
   reported when the kernel itself stops making progress.
 
 * Object handles.  Syscalls take kernel object pointers that must be in
@@ -367,11 +367,22 @@ Challenges and how they were handled
   reaches it too: a 12-byte k_msgq_get_attrs() at fz_mem-11 did); a
   hang is now HANG_MS without the input advancing, and RUN_MS ends a
   run that keeps consuming it.  As a backstop afl_syscall.py checks at
-  every group_op() entry that the op's input offset grows, ends the run
-  as done otherwise and logs the input's sha1 to
+  every group_op() entry that the stream position (upos) did not go
+  back (op offsets need not grow: a worker preempted between reading
+  its op byte and calling group_op() enters it late), ends the run as
+  done otherwise and logs the input's sha1 to
   crash-info/rewinds.log.  All 131 replayed representatives and samples
   of the weekend's hangs (and all objects crashes, see below) now end
-  as done.
+  as done.  RUN_MS was 1 s at first: in the first overnight campaign
+  inputs that ran that long (chains of short sleeps) entered the queue,
+  and some instances spent tens of minutes at ~1 exec/s mutating one of
+  them; 300 ms keeps their cost low.
+  The backstop also found a race of the harness itself: next_u8() read
+  and wrote upos non-atomically, so a worker preempted in between (the
+  thread group's priority/suspend ops make that common) wrote back an
+  old position after the other worker consumed bytes; ~0.2% of the
+  thread group's runs were cut short this way.  The position is now
+  taken with a CAS.
 
 * Coverage is verified, not assumed: replay_corpus.py -e dumps the
   edges of the seeds; each seed was checked to reach the kernel
