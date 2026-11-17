@@ -16,7 +16,7 @@
  *                User oopses (a syscall rejecting its arguments) and user
  *                faults are expected and only end the offending thread.
  *   afl_bug()  - fatal error in kernel context (CPU fault, panic, assertion)
- *   afl_hang() - a worker kept running for longer than HANG_MS
+ *   afl_hang() - a worker stayed runnable without consuming input for HANG_MS
  *
  * Before afl_bug() and afl_hang() the harness fills afl_crash, which the host
  * reads to describe the failure without needing any console output.
@@ -90,12 +90,18 @@ K_THREAD_STACK_DEFINE(dead_stack, 1024);
 static struct k_thread dead_thread;
 static k_tid_t main_tid;
 
-/* Whole run budget for the workers, and how long all may stay blocked */
+/*
+ * How long a runnable worker may go without consuming input (a hang), the
+ * whole run's budget (then the run just ends: long chains of short sleeps
+ * are not hangs) and how long all workers may stay blocked.
+ */
 #define HANG_MS    500
+#define RUN_MS     1000
 #define IDLE_TICKS 4
 
 K_APPMEM_PARTITION_DEFINE(fz_part);
 /* Last byte the workers can access (the partition is MPU-aligned) */
+extern char z_data_smem_fz_part_part_start[];
 extern char z_data_smem_fz_part_part_end[];
 
 /*
@@ -131,6 +137,24 @@ uint32_t next_u32(void)
 	return v;
 }
 
+/*
+ * A raw address from the input, except below the input buffer in the
+ * workers' partition: syscalls (or user code, e.g. sys_mutex on a raw
+ * pointer) writing into the stream state at the start of fz_mem rewind the
+ * stream, and the input then replays in a loop until the run budget is
+ * exhausted. Group data may precede fz_mem, so a write starting there can
+ * reach it too. Memory below the partition is not writable by the workers.
+ */
+void *fz_raw_ptr(void)
+{
+	uintptr_t v = next_u32();
+
+	if (v >= (uintptr_t)z_data_smem_fz_part_part_start && v < (uintptr_t)fz_mem.ubuf) {
+		return &scratch[0];
+	}
+	return (void *)v;
+}
+
 void *fz_ptr(void)
 {
 	uint8_t sel = next_u8();
@@ -143,7 +167,7 @@ void *fz_ptr(void)
 	case 2:
 		return &afl_crash;		/* kernel data */
 	case 3:
-		return (void *)(uintptr_t)next_u32();
+		return fz_raw_ptr();
 	case 4:
 		return &scratch[SCRATCH_SIZE - 1 - next_u8() % 8];	/* runs off scratch */
 	case 5:
@@ -208,7 +232,7 @@ struct k_thread *fz_thread(void)
 	case 6:
 		return NULL;
 	default:
-		return (struct k_thread *)(uintptr_t)next_u32();
+		return (struct k_thread *)fz_raw_ptr();
 	}
 }
 
@@ -332,16 +356,19 @@ static void hang(void)
  * Waits until the input is consumed and no worker can run any more (all are
  * dead, pending or suspended). Workers blocked forever, or deadlocked on each
  * other, are a user-level outcome, not a kernel bug: if no worker can run for
- * IDLE_TICKS consecutive ticks the run is over. A worker that is still
- * runnable after HANG_MS is a hang (e.g. a kernel livelock). The supervisor has
- * a higher priority than any user thread (users cannot raise theirs above
- * their own), so it gets to run every tick.
+ * IDLE_TICKS consecutive ticks the run is over. A worker that stays runnable
+ * for HANG_MS without the input advancing is a hang (e.g. a kernel livelock).
+ * After RUN_MS the run ends anyway: input still being consumed (e.g. many
+ * short sleeps) is progress, not a hang. The supervisor has a higher priority
+ * than any user thread (users cannot raise theirs above their own), so it
+ * gets to run every tick.
  */
 static void supervise(void)
 {
 	const uint8_t blocked = _THREAD_PENDING | _THREAD_SLEEPING | _THREAD_SUSPENDED |
 				_THREAD_DEAD;
-	int64_t deadline = k_uptime_get() + HANG_MS;
+	int64_t start = k_uptime_get();
+	int64_t deadline = start + HANG_MS;
 	int idle = 0;
 
 	uint32_t last_pos = 0;
@@ -357,7 +384,13 @@ static void supervise(void)
 		if (fz_mem.ulen != klen || fz_mem.upos < last_pos || fz_mem.upos > klen) {
 			return;
 		}
+		if (fz_mem.upos != last_pos) {
+			deadline = k_uptime_get() + HANG_MS;
+		}
 		last_pos = fz_mem.upos;
+		if (k_uptime_get() > start + RUN_MS) {
+			return;
+		}
 
 		for (int i = 0; i < NUM_WORKERS; i++) {
 			uint8_t state = workers[i].base.thread_state;

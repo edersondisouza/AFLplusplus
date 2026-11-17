@@ -54,8 +54,12 @@ config SYSCALL_FUZZ_SKIP_KNOWN_BUGS
 	  in the object size), k_msgq_alloc_init()
 	  with msg_size 0 (assert in put_msg_in_queue()), releasing a dynamic
 	  k_msgq/k_stack that was never initialized (k_free() of stale heap
-	  contents) and user threads deadlocking on k_mutex (assertion from
-	  MUTEX_DEADLOCK_DETECT). Disable to reproduce them.
+	  contents), user threads deadlocking on k_mutex (assertion from
+	  MUTEX_DEADLOCK_DETECT) and dynamic stacks or thread objects freed
+	  while a thread runs on them (a never-started thread keeps a
+	  reference to those a thread was created on, and such stacks are
+	  not passed to k_thread_stack_free()).
+	  Disable to reproduce them.
 
 # User threads deadlocking on k_mutex trip an assertion, see above
 config MUTEX_DEADLOCK_DETECT

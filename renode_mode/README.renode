@@ -274,9 +274,10 @@ Challenges and how they were handled
 * Blocking syscalls.  k_poll only needs one thread, but futex/condvar/
   event/join waits block forever.  Two user workers share the input,
   the supervisor (higher priority, kernel mode) ends the run when all
-  workers are blocked or dead, the system is idle for IDLE_TICKS, or
-  HANG_MS of uptime elapsed.  Real hangs are therefore only reported
-  when the kernel itself stops making progress.
+  workers are blocked or dead and the system is idle for IDLE_TICKS, or
+  after RUN_MS (1 s) of uptime.  A hang is a worker that stays runnable
+  for HANG_MS (500 ms) without the input advancing, so hangs are only
+  reported when the kernel itself stops making progress.
 
 * Object handles.  Syscalls take kernel object pointers that must be in
   the kernel object table and granted.  Inputs mostly select from per-group handle tables (static
@@ -350,19 +351,27 @@ Challenges and how they were handled
 
 * Hangs that are not hangs.  All hang representatives of the first
   weekend campaign (tracing every input, see export_findings.py) were
-  harness artefacts, of two kinds, still to be fixed:
+  harness artefacts, of two kinds:
   - the stream rewinds: a syscall given a raw pointer to fz_mem (e.g.
     k_thread_name_copy(.., 0x10000, 127) in the thread group) resets
     upos, and the input replays from the start until HANG_MS.  The
     supervisor only notices upos going backwards between two of its
     samples, and the workers get back past the old position within a
     tick.  This also made the thread group slow (~2 s per such input).
-  - the run budget: HANG_MS is a budget for the whole run, so long
-    chains of 1-3 tick sleeps (or waits with short timeouts) exceed it
-    while the kernel makes progress all along.
-  Possible fixes: keep raw pointers off the fz_mem header (or keep the
-  stream position where users cannot write it) and count a hang only
-  when the input position stops advancing for HANG_MS.
+  - the run budget: HANG_MS was a budget for the whole run, so long
+    chains of 1-3 tick sleeps (or waits with short timeouts) exceeded
+    it while the kernel made progress all along.
+  Fixed: raw pointers from the input (fz_raw_ptr()) never point between
+  the start of the partition and the input buffer (group data such as
+  the futex group's mutexes lies below fz_mem, so a write starting there
+  reaches it too: a 12-byte k_msgq_get_attrs() at fz_mem-11 did); a
+  hang is now HANG_MS without the input advancing, and RUN_MS ends a
+  run that keeps consuming it.  As a backstop afl_syscall.py checks at
+  every group_op() entry that the op's input offset grows, ends the run
+  as done otherwise and logs the input's sha1 to
+  crash-info/rewinds.log.  All 131 replayed representatives and samples
+  of the weekend's hangs (and all objects crashes, see below) now end
+  as done.
 
 * Coverage is verified, not assumed: replay_corpus.py -e dumps the
   edges of the seeds; each seed was checked to reach the kernel
@@ -426,12 +435,18 @@ them with replay.sh on a build with CONFIG_SYSCALL_FUZZ_SKIP_KNOWN_BUGS=n):
   exit_thread_userspace).  The kernel object system does not count a
   thread using a stack as a reference.  Found by the first weekend
   campaign, which skipped the bugs above; most of the objects group's
-  crashes are variants of it.  Not avoided by SKIP_KNOWN_BUGS yet.
+  crashes are variants of it.  The common path is not an explicit
+  release but a worker killed by an oops (e.g. k_object_release(NULL)),
+  which drops all its permissions.
   (dyn-stack-freed-while-thread-runs)
 
 CONFIG_SYSCALL_FUZZ_SKIP_KNOWN_BUGS (default y) avoids them so long
 campaigns are not filled with variants: too small stacks and msg_size 0
 are not passed, threads are not created on dynamic stacks with a size
 above the one allocated, dynamic msgq/stack objects are initialized
-right after allocation (the INIT op then fails on them), and
-MUTEX_DEADLOCK_DETECT defaults to n.  The stream format is the same either way.
+right after allocation (the INIT op then fails on them),
+MUTEX_DEADLOCK_DETECT defaults to n, and after creating a thread on a
+dynamic stack or thread object the worker grants both to a
+never-started "keeper" thread, so they always keep a reference, and
+such stacks are not passed to k_thread_stack_free() (which ignores
+references).  The stream format is the same either way.

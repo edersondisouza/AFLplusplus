@@ -173,8 +173,8 @@ def gate_block(pc, size):
             afl_renode.status = afl_renode.endgame[pc]
         in_window = False
         return
-    if pc == trace_pc:
-        trace_op()
+    if pc == group_op_pc:
+        op_entry()
     if not in_window:
         if pc in window_starts and afl_renode.status is None:
             in_window = True
@@ -361,8 +361,10 @@ def do_one_child():
         setup_window()
         global in_window
         in_window = False
-        if TRACE and trace_pc is None:
-            setup_trace()
+        if group_op_pc is None:
+            setup_op_hook()
+        global last_op_offset
+        last_op_offset = -1
         del trace[:]
         set_block_hook(gate_block)
     afl_renode.reset = False
@@ -387,15 +389,50 @@ def quantum_hook(mach):
         afl_renode.status = STATUS_HANG
 
 
-trace_pc = None
+group_op_pc = None
+last_op_offset = -1
+rewinds = 0
 trace = []
 trace_info = {}
 
 
+def setup_op_hook():
+    global group_op_pc
+    group_op_pc = -1    # not a syscall harness ELF: no hook
+    syms = dict((n, a) for a, _, n in symbols())
+    if "group_op" in syms and "fz_mem" in syms:
+        trace_info.update(fz_mem=syms["fz_mem"], kernel=syms.get("_kernel"))
+        group_op_pc = syms["group_op"]
+    if TRACE:
+        setup_trace()
+
+
+def op_entry():
+    '''At group_op entry: main.c has just stored the op's offset and byte.
+
+    The input offset of successive ops only grows. If it goes back, a
+    syscall overwrote the stream position (the guest keeps raw pointers off
+    it, so this is a harness bug): the input would replay in a loop until
+    the run budget, so end the run here like the guest's own tamper check,
+    and log the input.'''
+    global last_op_offset, rewinds
+    bus = monitor.Machine[sysbus_name]
+    offset = int(bus.ReadDoubleWord(System.UInt64(trace_info["fz_mem"] + 8)))
+    if offset <= last_op_offset:
+        rewinds += 1
+        if not TRACE and afl_renode.status is None:
+            afl_renode.status = STATUS_SUCCESS
+            if CRASH_INFO_DIR:
+                with open(os.path.join(CRASH_INFO_DIR, "rewinds.log"), "a") as f:
+                    f.write("%s\n" % hashlib.sha1(last_input).hexdigest())
+    last_op_offset = offset
+    if TRACE:
+        trace_op(offset)
+
+
 def setup_trace():
-    '''Finds group_op, the group (from its Kconfig symbol) and its op names
-    (the enum in src/group_<name>.c).'''
-    global trace_pc
+    '''Finds the group (from its Kconfig symbol) and its op names (the enum
+    in src/group_<name>.c).'''
     elf = os.environ["AFL_RENODE_ELF"]
     conf = dict((n, v) for v, _, _, shndx, n in elf_symtab(elf)
                 if shndx == 0xfff1 and n.startswith("CONFIG_"))
@@ -414,19 +451,14 @@ def setup_trace():
     workers, size = syms["workers"]
     nworkers = conf.get("CONFIG_SYSCALL_FUZZ_WORKERS", 2)
     trace_info.update(group=groups[0], names=names, workers=workers,
-                      thread_size=size // nworkers, nworkers=nworkers,
-                      fz_mem=syms["fz_mem"][0], kernel=syms["_kernel"][0])
-    trace_pc = syms["group_op"][0]
+                      thread_size=size // nworkers, nworkers=nworkers)
 
 
-def trace_op():
-    '''At group_op entry: main.c has just stored the op's offset and byte'''
+def trace_op(offset):
     bus = monitor.Machine[sysbus_name]
-    fz = trace_info["fz_mem"]
-    offset = bus.ReadDoubleWord(System.UInt64(fz + 8))       # fz_mem.op_offset
-    op = bus.ReadByte(System.UInt64(fz + 12))                # fz_mem.cur_op
+    op = bus.ReadByte(System.UInt64(trace_info["fz_mem"] + 12))  # fz_mem.cur_op
     cur = bus.ReadDoubleWord(System.UInt64(trace_info["kernel"] + 8))  # _kernel.cpus[0].current
-    trace.append((int(offset), int(op), int(cur), quanta))
+    trace.append((offset, int(op), int(cur), quanta))
 
 
 def thread_name(addr):
@@ -443,10 +475,10 @@ def write_trace(status):
              "# arguments are the bytes up to the next op, in execution order",
              "# offset  quantum  worker  op",
              ]
-    rewinds = sum(1 for a, b in zip(trace, trace[1:]) if b[0] <= a[0])
-    if rewinds:
+    n = sum(1 for a, b in zip(trace, trace[1:]) if b[0] <= a[0])
+    if n:
         lines.append("# stream rewound %d times: a syscall overwrote the workers' "
-                     "input position (harness artefact)" % rewinds)
+                     "input position (harness artefact)" % n)
     for i, (offset, op, cur, q) in enumerate(trace):
         if TRACE_KEEP <= i < len(trace) - TRACE_KEEP:
             if i == TRACE_KEEP:
@@ -530,7 +562,7 @@ def one_fuzz_complete(status):
     if held:
         return
     flush_edge_log()
-    if TRACE and trace_pc is not None:
+    if TRACE and group_op_pc not in (None, -1):
         write_trace(status)
     if status != STATUS_SUCCESS:
         text = "\n".join(describe_failure(status)) + "\n"

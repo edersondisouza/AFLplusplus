@@ -76,7 +76,7 @@ static void do_poll(void)
 		num = (int)next_u32();
 	}
 	if (flags & BIT(1)) {
-		ev = (flags & BIT(2)) ? (struct k_poll_event *)(uintptr_t)next_u32()
+		ev = (flags & BIT(2)) ? (struct k_poll_event *)fz_raw_ptr()
 				      : (struct k_poll_event *)&fz_heap;
 	}
 

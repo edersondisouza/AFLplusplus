@@ -50,7 +50,7 @@ static struct k_futex *futex(void)
 	case 6:
 		return NULL;
 	default:
-		return (struct k_futex *)(uintptr_t)next_u32();
+		return (struct k_futex *)fz_raw_ptr();
 	}
 }
 
@@ -70,7 +70,7 @@ static struct sys_mutex *mutex(void)
 	case 4:
 		return NULL;
 	default:
-		return (struct sys_mutex *)(uintptr_t)next_u32();
+		return (struct sys_mutex *)fz_raw_ptr();
 	}
 }
 
@@ -90,7 +90,7 @@ static struct k_msgq *msgq(void)
 	case 4:
 		return NULL;
 	default:
-		return (struct k_msgq *)(uintptr_t)next_u32();
+		return (struct k_msgq *)fz_raw_ptr();
 	}
 }
 
@@ -108,7 +108,7 @@ static struct k_queue *queue_sel(void)
 	case 3:
 		return NULL;
 	default:
-		return (struct k_queue *)(uintptr_t)next_u32();
+		return (struct k_queue *)fz_raw_ptr();
 	}
 }
 

@@ -32,6 +32,15 @@ K_APP_BMEM(fz_part) static k_thread_stack_t *stk[NUM_STACKS];
 K_APP_BMEM(fz_part) static size_t slot_stack_size[NUM_SLOTS];
 K_APP_BMEM(fz_part) static size_t stk_size[NUM_STACKS];
 K_APP_BMEM(fz_part) static uint32_t evset;
+/*
+ * SKIP_KNOWN_BUGS: dynamic stacks a thread was created on, which must not be
+ * freed while it may run, and a never-started thread that keeps a reference
+ * to them (see do_thread_create()).
+ */
+#define MAX_BUSY (NUM_SLOTS + NUM_STACKS)
+K_APP_BMEM(fz_part) static const void *busy[MAX_BUSY];
+static struct k_thread keeper;
+static K_THREAD_STACK_DEFINE(keeper_stack, 256);
 
 static const enum k_objects types[] = {
 	K_OBJ_SEM, K_OBJ_EVENT, K_OBJ_CONDVAR, K_OBJ_MUTEX, K_OBJ_MSGQ,
@@ -91,7 +100,45 @@ static void *obj(void)
 	case 7:
 		return NULL;
 	default:
-		return (void *)(uintptr_t)next_u32();
+		return fz_raw_ptr();
+	}
+}
+
+static bool is_dynamic(const void *o)
+{
+	for (int i = 0; i < NUM_SLOTS; i++) {
+		if (o != NULL && o == slot[i]) {
+			return true;
+		}
+	}
+	for (int i = 0; i < NUM_STACKS; i++) {
+		if (o != NULL && (const void *)o == stk[i]) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool is_busy(const void *o)
+{
+	for (int i = 0; i < MAX_BUSY; i++) {
+		if (o != NULL && busy[i] == o) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void set_busy(const void *o)
+{
+	if (!is_dynamic(o) || is_busy(o)) {
+		return;
+	}
+	for (int i = 0; i < MAX_BUSY; i++) {
+		if (busy[i] == NULL) {
+			busy[i] = o;
+			return;
+		}
 	}
 }
 
@@ -310,12 +357,41 @@ static void do_thread_create(void)
 	    (size < KNOWN_BUG_MIN_STACK || size > dyn_stack_size(s))) {
 		return;
 	}
-	(void)k_thread_create(t, s, size, fz_child_entry, (void *)ticks, NULL, NULL,
-			      K_PRIO_PREEMPT(1 + prio % 8), options, delay);
+	if (IS_ENABLED(CONFIG_SYSCALL_FUZZ_SKIP_KNOWN_BUGS)) {
+		/* Before the call: the new thread may run at once */
+		set_busy(s);
+	}
+	k_tid_t tid = k_thread_create(t, s, size, fz_child_entry, (void *)ticks, NULL, NULL,
+				      K_PRIO_PREEMPT(1 + prio % 8), options, delay);
+
+	/*
+	 * Known bug: a dynamic stack or thread object is freed when the last
+	 * thread with permission on it drops it (k_object_release(), exit,
+	 * or an oops killing a worker) while a thread still runs on it. The
+	 * create succeeded, so the caller has permission on both: the keeper
+	 * holds one for good. It cannot be done before: the grant oopses
+	 * where the create may just fail.
+	 */
+	if (IS_ENABLED(CONFIG_SYSCALL_FUZZ_SKIP_KNOWN_BUGS) && tid != NULL) {
+		if (is_dynamic(s)) {
+			k_object_access_grant(s, &keeper);
+		}
+		if (is_dynamic(t)) {
+			k_object_access_grant(t, &keeper);
+		}
+	}
 }
 
 void group_setup(void)
 {
+	if (IS_ENABLED(CONFIG_SYSCALL_FUZZ_SKIP_KNOWN_BUGS)) {
+		k_thread_create(&keeper, keeper_stack, K_THREAD_STACK_SIZEOF(keeper_stack),
+				fz_child_entry, NULL, NULL, NULL, K_PRIO_PREEMPT(2), K_USER,
+				K_FOREVER);
+		for (int i = 0; i < NUM_WORKERS; i++) {
+			k_object_access_grant(&keeper, &workers[i]);
+		}
+	}
 	for (int i = 0; i < NUM_WORKERS; i++) {
 		k_thread_access_grant(&workers[i], &st_sem, &st_event, &st_condvar, &st_mutex);
 	}
@@ -411,9 +487,14 @@ void group_op(uint8_t op)
 		stk_size[i] = size;
 		break;
 	}
-	case OP_STACK_FREE:
-		(void)k_thread_stack_free(stack());
+	case OP_STACK_FREE: {
+		k_thread_stack_t *s = stack();
+
+		if (!IS_ENABLED(CONFIG_SYSCALL_FUZZ_SKIP_KNOWN_BUGS) || !is_busy(s)) {
+			(void)k_thread_stack_free(s);
+		}
 		break;
+	}
 	case OP_THREAD_CREATE:
 		do_thread_create();
 		break;

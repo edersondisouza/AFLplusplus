@@ -46,6 +46,7 @@ uint32_t next_u32(void);
  * caller has no access to, NULL and raw 32-bit values from the input.
  */
 void *fz_ptr(void);	    /* buffer pointer for copies in/out */
+void *fz_raw_ptr(void);	    /* raw 32-bit address, never into the stream state */
 size_t fz_len(void);	    /* buffer length */
 k_timeout_t fz_timeout(void);
 struct k_thread *fz_thread(void);
